@@ -9,21 +9,32 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # sccache wraps rustc et met en cache chaque unité de compilation dans GitHub Actions Cache.
+  # Résultat : même si Cargo.lock change, seuls les nouveaux crates sont recompilés.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── Rust ────────────────────────────────────────────────────────────────
       - name: Install Rust stable (MSVC)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cache cargo registry
+      # sccache doit être démarré AVANT tout cargo pour intercepter rustc
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.5
+
+      # ── Caches Cargo ────────────────────────────────────────────────────────
+      - name: Cache cargo registry (crates téléchargés)
         uses: actions/cache@v4
         with:
           path: |
@@ -31,7 +42,19 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
 
+      - name: Cache target/ (artefacts de build et linking)
+        uses: actions/cache@v4
+        with:
+          path: target/
+          # Clé précise : invalide si Cargo.lock ou les sources changent
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**', 'build.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-target-
+
+      # ── Outils cargo ────────────────────────────────────────────────────────
       - name: Cache cargo tools (cargo-make, rust-script)
         id: cache-tools
         uses: actions/cache@v4
@@ -43,69 +66,162 @@ jobs:
         if: steps.cache-tools.outputs.cache-hit != 'true'
         run: cargo install cargo-make rust-script --locked
 
-      - name: Install LLVM (requis par wdk-sys/bindgen)
-        run: choco install llvm -y --no-progress
-
-      - name: Install WDK matching the pre-installed Windows SDK
+      # ── Détection version SDK (nécessaire pour les clés de cache WDK) ───────
+      - name: Detect Windows SDK version
+        id: sdk
         shell: pwsh
         run: |
-          # Le runner windows-latest embarque un SDK Windows (ex: 10.0.26100.0).
-          # wdk-sys/bindgen cherche les headers kernel (km/) pour cette version exacte.
-          # On installe le WDK correspondant via le téléchargement officiel Microsoft.
-
           $kitsRoot = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots").KitsRoot10
-          $sdkVersion = Get-ChildItem "$kitsRoot\Include" -Directory |
+          $ver = Get-ChildItem "$kitsRoot\Include" -Directory |
             Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
             Sort-Object Name -Descending |
             Select-Object -First 1 -ExpandProperty Name
+          Write-Host "SDK détecté : $ver"
+          echo "version=$ver"     >> $env:GITHUB_OUTPUT
+          echo "kitsRoot=$kitsRoot" >> $env:GITHUB_OUTPUT
 
-          Write-Host "SDK détecté : $sdkVersion"
+      # ── LLVM ────────────────────────────────────────────────────────────────
+      - name: Cache LLVM installation
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\LLVM
+          key: llvm-windows-v1
 
-          $kmPath = "${kitsRoot}Include\$sdkVersion\km"
-          if (Test-Path $kmPath) {
-            Write-Host "Headers WDK déjà présents : $kmPath"
+      - name: Install LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: choco install llvm -y --no-progress
+
+      # ── WDK ─────────────────────────────────────────────────────────────────
+      # On ne cache que les dossiers ajoutés par le WDK (km headers + tools).
+      # Le SDK pré-installé gère le reste (shared/, um/, etc.).
+      - name: Cache WDK kernel headers + tools
+        id: cache-wdk
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files (x86)\Windows Kits\10\Include\${{ steps.sdk.outputs.version }}\km
+            C:\Program Files (x86)\Windows Kits\10\Lib\${{ steps.sdk.outputs.version }}\km
+            C:\Program Files (x86)\Windows Kits\10\bin\${{ steps.sdk.outputs.version }}\x64
+          key: wdk-${{ steps.sdk.outputs.version }}-v1
+
+      - name: Install and configure WDK
+        if: steps.cache-wdk.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $kitsRoot   = "${{ steps.sdk.outputs.kitsRoot }}"
+          $sdkVersion = "${{ steps.sdk.outputs.version }}"
+          $kmTarget   = "${kitsRoot}Include\$sdkVersion\km"
+
+          # --- Diagnostic : état initial ---
+          Write-Host "=== Windows Kits\Include (avant install) ==="
+          Get-ChildItem "${kitsRoot}Include" -Directory | ForEach-Object {
+            $sub = (Get-ChildItem $_.FullName -Directory -EA SilentlyContinue).Name -join ', '
+            Write-Host "  $($_.Name) : [$sub]"
+          }
+
+          # Fonction utilitaire : crée symlinks km/ pour la version cible
+          function Set-KmSymlinks($srcVer) {
+            $srcInclude = "${kitsRoot}Include\$srcVer\km"
+            Write-Host "Symlink Include : $srcVer\km -> $sdkVersion\km"
+            New-Item -ItemType SymbolicLink -Path $kmTarget -Target $srcInclude -Force | Out-Null
+
+            $srcLib = "${kitsRoot}Lib\$srcVer\km"
+            $dstLib = "${kitsRoot}Lib\$sdkVersion\km"
+            if ((Test-Path $srcLib) -and (-not (Test-Path $dstLib))) {
+              New-Item -ItemType Directory -Path "${kitsRoot}Lib\$sdkVersion" -Force | Out-Null
+              Write-Host "Symlink Lib : $srcVer\km -> $sdkVersion\km"
+              New-Item -ItemType SymbolicLink -Path $dstLib -Target $srcLib -Force | Out-Null
+            }
+          }
+
+          # 1. km/ déjà au bon endroit ?
+          if (Test-Path $kmTarget) {
+            Write-Host "WDK km/ déjà présent : $kmTarget"
             exit 0
           }
 
-          Write-Host "Téléchargement du WDK $sdkVersion ..."
-          # URL officielle Microsoft — WDK Windows 11 24H2 (10.0.26100)
-          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2249371"
-          $installer = "$env:TEMP\wdksetup.exe"
-          Invoke-WebRequest -Uri $wdkUrl -OutFile $installer -UseBasicParsing
-
-          Write-Host "Installation silencieuse du WDK ..."
-          Start-Process -Wait -FilePath $installer `
-            -ArgumentList "/quiet /norestart /features OptionId.WindowsDriverKitComplete"
-
-          if (-not (Test-Path $kmPath)) {
-            Write-Error "WDK installé mais km/ introuvable : $kmPath"
-            exit 1
+          # 2. km/ présent pour une autre version ? → symlinks directs
+          $existing = Get-ChildItem "${kitsRoot}Include" -Directory |
+            Where-Object { Test-Path "$($_.FullName)\km" } |
+            Sort-Object Name -Descending
+          if ($existing) {
+            Set-KmSymlinks $existing[0].Name
+            Write-Host "WDK prêt via symlinks (pas de téléchargement nécessaire)"
+            exit 0
           }
-          Write-Host "WDK $sdkVersion installé avec succès"
 
+          # 3. Téléchargement du WDK
+          Write-Host "Aucun km/ trouvé — téléchargement du WDK..."
+          $installer = "$env:TEMP\wdksetup.exe"
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2249371" `
+            -OutFile $installer -UseBasicParsing
+          $proc = Start-Process -Wait -PassThru -FilePath $installer `
+            -ArgumentList "/quiet /norestart"
+          Write-Host "Exit code installeur : $($proc.ExitCode)"
+
+          # Diagnostic post-install
+          Write-Host "=== Windows Kits\Include (après install) ==="
+          Get-ChildItem "${kitsRoot}Include" -Directory | ForEach-Object {
+            $sub = (Get-ChildItem $_.FullName -Directory -EA SilentlyContinue).Name -join ', '
+            Write-Host "  $($_.Name) : [$sub]"
+          }
+
+          # 4. km/ maintenant au bon endroit ?
+          if (Test-Path $kmTarget) {
+            Write-Host "WDK installé avec correspondance de version parfaite"
+            exit 0
+          }
+
+          # 5. km/ installé mais version différente ? → symlinks
+          $installed = Get-ChildItem "${kitsRoot}Include" -Directory |
+            Where-Object { Test-Path "$($_.FullName)\km" } |
+            Sort-Object Name -Descending
+          if ($installed) {
+            Write-Host "Version WDK=$($installed[0].Name) ≠ SDK=$sdkVersion → symlinks"
+            Set-KmSymlinks $installed[0].Name
+            exit 0
+          }
+
+          Write-Error "WDK introuvable même après installation"
+          exit 1
+
+      # ── Paths d'environnement ────────────────────────────────────────────────
       - name: Set LLVM and WDK paths
         shell: pwsh
         run: |
-          $llvmBin = "C:\Program Files\LLVM\bin"
+          $llvmBin  = "C:\Program Files\LLVM\bin"
+          $kitsRoot = "${{ steps.sdk.outputs.kitsRoot }}"
 
-          # Détection dynamique de la version WDK/SDK installée
-          $wdkBinRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
-          $wdkVersion = Get-ChildItem $wdkBinRoot -Directory |
+          # Chercher le dossier bin WDK qui contient stampinf.exe (version réelle installée)
+          $wdkBin = Get-ChildItem "${kitsRoot}bin" -Directory |
             Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
             Sort-Object Name -Descending |
-            Select-Object -First 1
-          $wdkBin = Join-Path $wdkVersion.FullName "x64"
+            Where-Object { Test-Path "$($_.FullName)\x64\stampinf.exe" } |
+            Select-Object -First 1 |
+            ForEach-Object { "$($_.FullName)\x64" }
 
-          Write-Host "LLVM  : $llvmBin"
-          Write-Host "WDK   : $wdkBin"
+          if (-not $wdkBin) {
+            Write-Error "stampinf.exe introuvable dans Windows Kits\bin"
+            exit 1
+          }
+
+          Write-Host "LLVM : $llvmBin"
+          Write-Host "WDK  : $wdkBin"
 
           echo "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
-          echo "$llvmBin"               >> $env:GITHUB_PATH
-          echo "$wdkBin"               >> $env:GITHUB_PATH
+          echo "$llvmBin"              >> $env:GITHUB_PATH
+          echo "$wdkBin"              >> $env:GITHUB_PATH
 
+      # ── Build ────────────────────────────────────────────────────────────────
       - name: Build driver package
         run: cargo make
 
+      - name: Show sccache stats
+        run: sccache --show-stats
+        if: always()
+
+      # ── Packaging ────────────────────────────────────────────────────────────
       - name: Package artifacts
         shell: pwsh
         run: |
