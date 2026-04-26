@@ -10,7 +10,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
+  # RUSTC_WRAPPER est activé conditionnellement après vérification de sccache
 
 jobs:
   build:
@@ -30,6 +30,21 @@ jobs:
       # sccache intercepte rustc → cache chaque unité de compilation individuellement
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.5
+
+      # Activer RUSTC_WRAPPER=sccache seulement si sccache démarre correctement.
+      # Si le service GitHub Actions Cache est indisponible (HTTP 4xx/5xx),
+      # sccache échoue au démarrage → on build sans cache plutôt que de tout bloquer.
+      - name: Enable sccache (if available)
+        shell: pwsh
+        run: |
+          $stats = sccache --show-stats 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "sccache opérationnel — cache activé"
+            echo "RUSTC_WRAPPER=sccache" >> $env:GITHUB_ENV
+          } else {
+            Write-Warning "sccache indisponible (GHA cache inaccessible) — build sans cache"
+            Write-Host $stats
+          }
 
       # ── Caches Cargo ─────────────────────────────────────────────────────────
       - name: Cache cargo registry
