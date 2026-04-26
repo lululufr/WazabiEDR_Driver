@@ -1,0 +1,67 @@
+;
+; WazabiEDR_Agent.inx
+; Kernel-mode EDR agent driver (KMDF, root-enumerated)
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = "ActivityMonitor"
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %ManufacturerName%
+DriverVer   =
+CatalogFile = WazabiEDR_Agent.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+WazabiEDR_Agent.CopyFiles = 13  ; Driver Store (isolated, required for Win10 2004+)
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+WazabiEDR_Agent.sys = 1,,
+
+; ==================== OS / Architecture Targets ====================
+
+[Manufacturer]
+%ManufacturerName% = Standard, NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%WazabiEDR_Agent.DeviceDesc% = WazabiEDR_Agent_Device, Root\WazabiEDR_Agent
+
+; ==================== Installation ====================
+
+[WazabiEDR_Agent_Device.NT]
+CopyFiles = WazabiEDR_Agent.CopyFiles
+
+[WazabiEDR_Agent.CopyFiles]
+WazabiEDR_Agent.sys
+
+; ==================== Service ====================
+
+[WazabiEDR_Agent_Device.NT.Services]
+AddService = WazabiEDR_Agent, %SPSVCINST_ASSOCSERVICE%, WazabiEDR_Agent_Service_Inst
+
+[WazabiEDR_Agent_Service_Inst]
+DisplayName   = %WazabiEDR_Agent.SvcDesc%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 1               ; SERVICE_SYSTEM_START — chargé tôt au démarrage
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\WazabiEDR_Agent.sys
+
+; ==================== WDF ====================
+
+[WazabiEDR_Agent_Device.NT.Wdf]
+KmdfService = WazabiEDR_Agent, WazabiEDR_Agent_Wdf_Inst
+
+[WazabiEDR_Agent_Wdf_Inst]
+KmdfLibraryVersion = $KMDFVERSION$
+
+; ==================== Strings ====================
+
+[Strings]
+SPSVCINST_ASSOCSERVICE        = 0x00000002
+ManufacturerName              = "Wazabi Security"
+DiskName                      = "WazabiEDR Agent Installation Disk"
+WazabiEDR_Agent.DeviceDesc    = "Wazabi EDR Agent"
+WazabiEDR_Agent.SvcDesc       = "Wazabi EDR Agent Service"
