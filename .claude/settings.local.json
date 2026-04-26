@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/c/Users/lucas/Documents/WAZABI/**)",
+      "Read(//mnt/c/Users/lucas/Documents/WAZABI/WazabiEDR_Agent/**)"
+    ]
+  }
+}

@@ -1,0 +1,97 @@
+name: Build WazabiEDR Agent
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo tools (cargo-make, rust-script)
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-tools-v1
+
+      - name: Install cargo-make and rust-script
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: cargo install cargo-make rust-script --locked
+
+      - name: Install LLVM (requis par wdk-sys/bindgen)
+        run: choco install llvm -y --no-progress
+
+      - name: Install Windows Driver Kit 11
+        run: choco install windowsdriverkit11 -y --no-progress
+
+      - name: Set LLVM and WDK paths
+        shell: pwsh
+        run: |
+          $llvmBin = "C:\Program Files\LLVM\bin"
+
+          # Détection dynamique de la version WDK installée
+          $wdkBinRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $wdkVersion = Get-ChildItem $wdkBinRoot -Directory |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+          $wdkBin = Join-Path $wdkVersion.FullName "x64"
+
+          Write-Host "LLVM  : $llvmBin"
+          Write-Host "WDK   : $wdkBin"
+
+          echo "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
+          echo "$llvmBin"               >> $env:GITHUB_PATH
+          echo "$wdkBin"               >> $env:GITHUB_PATH
+
+      - name: Build driver package
+        run: cargo make
+
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          $pkg = "target\debug\WazabiEDR_Agent_package"
+          Compress-Archive -Path "$pkg\*" -DestinationPath "WazabiEDR_Agent.zip" -Force
+          Write-Host "Contenu du package :"
+          Get-ChildItem $pkg | Format-Table Name, Length
+
+      - name: Upload artifact (tous les commits)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WazabiEDR_Agent-${{ github.sha }}
+          path: WazabiEDR_Agent.zip
+          retention-days: 30
+
+      - name: Create GitHub Release (tags uniquement)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: WazabiEDR_Agent.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
