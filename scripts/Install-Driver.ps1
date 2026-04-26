@@ -58,11 +58,9 @@ Write-Step "Récupération de la release '$Tag' depuis github.com/$Repo ..."
 $headers = @{ Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" }
 if ($Token) { $headers["Authorization"] = "Bearer $Token" }
 
-$apiUrl = if ($Tag -eq "latest") {
-    "https://api.github.com/repos/$Repo/releases/latest"
-} else {
-    "https://api.github.com/repos/$Repo/releases/tags/$Tag"
-}
+# /releases/latest ignore les prereleases → utiliser /releases/tags/latest
+# pour récupérer le rolling build master (marqué prerelease dans le workflow).
+$apiUrl = "https://api.github.com/repos/$Repo/releases/tags/$Tag"
 
 try {
     $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers
