@@ -67,18 +67,20 @@ jobs:
       - name: Install LLVM 17.0.6
         shell: pwsh
         run: |
-          $installed = winget list --id LLVM.LLVM 2>$null | Select-String "LLVM.LLVM"
-          if ($installed) {
-            Write-Host "LLVM déjà installé"
+          $clangPath = "C:\Program Files\LLVM\bin"
+
+          # Vérification directe du binaire — évite winget list qui déclenche
+          # les accords msstore et tente un upgrade (exit 1 si déjà à jour).
+          if (Test-Path "$clangPath\clang.exe") {
+            Write-Host "LLVM déjà installé : $clangPath"
           } else {
             winget install --id LLVM.LLVM --version 17.0.6 `
               --accept-package-agreements --accept-source-agreements `
               --silent --disable-interactivity
           }
 
-          $clangPath = "C:\Program Files\LLVM\bin"
-          echo "LIBCLANG_PATH=$clangPath"  >> $env:GITHUB_ENV
-          echo "$clangPath"               >> $env:GITHUB_PATH
+          echo "LIBCLANG_PATH=$clangPath" >> $env:GITHUB_ENV
+          echo "$clangPath"              >> $env:GITHUB_PATH
 
       # ── WDK via NuGet ────────────────────────────────────────────────────────
       # Microsoft utilise NuGet (pas l'installeur système) pour le WDK 10.0.26100.
