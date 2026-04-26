@@ -9,8 +9,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # sccache wraps rustc et met en cache chaque unité de compilation dans GitHub Actions Cache.
-  # Résultat : même si Cargo.lock change, seuls les nouveaux crates sont recompilés.
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: sccache
 
@@ -19,22 +17,22 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
+      # ── Checkout ─────────────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Rust ────────────────────────────────────────────────────────────────
+      # ── Rust ─────────────────────────────────────────────────────────────────
       - name: Install Rust stable (MSVC)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      # sccache doit être démarré AVANT tout cargo pour intercepter rustc
+      # sccache intercepte rustc → cache chaque unité de compilation individuellement
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.5
 
-      # ── Caches Cargo ────────────────────────────────────────────────────────
-      - name: Cache cargo registry (crates téléchargés)
+      # ── Caches Cargo ─────────────────────────────────────────────────────────
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
@@ -44,184 +42,124 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-registry-
 
-      - name: Cache target/ (artefacts de build et linking)
+      - name: Cache target/
         uses: actions/cache@v4
         with:
           path: target/
-          # Clé précise : invalide si Cargo.lock ou les sources changent
           key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**', 'build.rs') }}
           restore-keys: |
             ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
             ${{ runner.os }}-target-
 
-      # ── Outils cargo ────────────────────────────────────────────────────────
-      - name: Cache cargo tools (cargo-make, rust-script)
-        id: cache-tools
-        uses: actions/cache@v4
+      # ── Outils cargo ─────────────────────────────────────────────────────────
+      # taiki-e/install-action télécharge des binaires pré-compilés (≈5s vs ≈5min pour cargo install)
+      - name: Install cargo-make
+        uses: taiki-e/install-action@v2
         with:
-          path: ~/.cargo/bin
-          key: ${{ runner.os }}-cargo-tools-v1
+          tool: cargo-make
 
-      - name: Install cargo-make and rust-script
-        if: steps.cache-tools.outputs.cache-hit != 'true'
-        run: cargo install cargo-make rust-script --locked
+      - name: Install rust-script
+        uses: taiki-e/install-action@v2
+        with:
+          tool: rust-script
 
-      # ── Détection version SDK (nécessaire pour les clés de cache WDK) ───────
-      - name: Detect Windows SDK version
-        id: sdk
+      # ── LLVM (bindgen) ───────────────────────────────────────────────────────
+      - name: Install LLVM 17.0.6
         shell: pwsh
         run: |
-          $kitsRoot = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots").KitsRoot10
-          $ver = Get-ChildItem "$kitsRoot\Include" -Directory |
-            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-            Sort-Object Name -Descending |
-            Select-Object -First 1 -ExpandProperty Name
-          Write-Host "SDK détecté : $ver"
-          echo "version=$ver"     >> $env:GITHUB_OUTPUT
-          echo "kitsRoot=$kitsRoot" >> $env:GITHUB_OUTPUT
-
-      # ── LLVM ────────────────────────────────────────────────────────────────
-      - name: Cache LLVM installation
-        id: cache-llvm
-        uses: actions/cache@v4
-        with:
-          path: C:\Program Files\LLVM
-          key: llvm-windows-v1
-
-      - name: Install LLVM
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
-        run: choco install llvm -y --no-progress
-
-      # ── WDK ─────────────────────────────────────────────────────────────────
-      # On ne cache que les dossiers ajoutés par le WDK (km headers + tools).
-      # Le SDK pré-installé gère le reste (shared/, um/, etc.).
-      - name: Cache WDK kernel headers + tools
-        id: cache-wdk
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:\Program Files (x86)\Windows Kits\10\Include\${{ steps.sdk.outputs.version }}\km
-            C:\Program Files (x86)\Windows Kits\10\Lib\${{ steps.sdk.outputs.version }}\km
-            C:\Program Files (x86)\Windows Kits\10\bin\${{ steps.sdk.outputs.version }}\x64
-          key: wdk-${{ steps.sdk.outputs.version }}-v1
-
-      - name: Install and configure WDK
-        if: steps.cache-wdk.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $kitsRoot   = "${{ steps.sdk.outputs.kitsRoot }}"
-          $sdkVersion = "${{ steps.sdk.outputs.version }}"
-          $kmTarget   = "${kitsRoot}Include\$sdkVersion\km"
-
-          # --- Diagnostic : état initial ---
-          Write-Host "=== Windows Kits\Include (avant install) ==="
-          Get-ChildItem "${kitsRoot}Include" -Directory | ForEach-Object {
-            $sub = (Get-ChildItem $_.FullName -Directory -EA SilentlyContinue).Name -join ', '
-            Write-Host "  $($_.Name) : [$sub]"
-          }
-
-          # Fonction utilitaire : crée symlinks km/ pour la version cible
-          function Set-KmSymlinks($srcVer) {
-            $srcInclude = "${kitsRoot}Include\$srcVer\km"
-            Write-Host "Symlink Include : $srcVer\km -> $sdkVersion\km"
-            New-Item -ItemType SymbolicLink -Path $kmTarget -Target $srcInclude -Force | Out-Null
-
-            $srcLib = "${kitsRoot}Lib\$srcVer\km"
-            $dstLib = "${kitsRoot}Lib\$sdkVersion\km"
-            if ((Test-Path $srcLib) -and (-not (Test-Path $dstLib))) {
-              New-Item -ItemType Directory -Path "${kitsRoot}Lib\$sdkVersion" -Force | Out-Null
-              Write-Host "Symlink Lib : $srcVer\km -> $sdkVersion\km"
-              New-Item -ItemType SymbolicLink -Path $dstLib -Target $srcLib -Force | Out-Null
-            }
-          }
-
-          # 1. km/ déjà au bon endroit ?
-          if (Test-Path $kmTarget) {
-            Write-Host "WDK km/ déjà présent : $kmTarget"
-            exit 0
-          }
-
-          # 2. km/ présent pour une autre version ? → symlinks directs
-          $existing = Get-ChildItem "${kitsRoot}Include" -Directory |
-            Where-Object { Test-Path "$($_.FullName)\km" } |
-            Sort-Object Name -Descending
-          if ($existing) {
-            Set-KmSymlinks $existing[0].Name
-            Write-Host "WDK prêt via symlinks (pas de téléchargement nécessaire)"
-            exit 0
-          }
-
-          # 3. Téléchargement du WDK
-          Write-Host "Aucun km/ trouvé — téléchargement du WDK..."
-          $installer = "$env:TEMP\wdksetup.exe"
-          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2249371" `
-            -OutFile $installer -UseBasicParsing
-          $proc = Start-Process -Wait -PassThru -FilePath $installer `
-            -ArgumentList "/quiet /norestart"
-          Write-Host "Exit code installeur : $($proc.ExitCode)"
-
-          # Diagnostic post-install
-          Write-Host "=== Windows Kits\Include (après install) ==="
-          Get-ChildItem "${kitsRoot}Include" -Directory | ForEach-Object {
-            $sub = (Get-ChildItem $_.FullName -Directory -EA SilentlyContinue).Name -join ', '
-            Write-Host "  $($_.Name) : [$sub]"
-          }
-
-          # 4. km/ maintenant au bon endroit ?
-          if (Test-Path $kmTarget) {
-            Write-Host "WDK installé avec correspondance de version parfaite"
-            exit 0
-          }
-
-          # 5. km/ installé mais version différente ? → symlinks
-          $installed = Get-ChildItem "${kitsRoot}Include" -Directory |
-            Where-Object { Test-Path "$($_.FullName)\km" } |
-            Sort-Object Name -Descending
+          $installed = winget list --id LLVM.LLVM 2>$null | Select-String "LLVM.LLVM"
           if ($installed) {
-            Write-Host "Version WDK=$($installed[0].Name) ≠ SDK=$sdkVersion → symlinks"
-            Set-KmSymlinks $installed[0].Name
-            exit 0
+            Write-Host "LLVM déjà installé"
+          } else {
+            winget install --id LLVM.LLVM --version 17.0.6 `
+              --accept-package-agreements --accept-source-agreements `
+              --silent --disable-interactivity
           }
 
-          Write-Error "WDK introuvable même après installation"
-          exit 1
+          $clangPath = "C:\Program Files\LLVM\bin"
+          echo "LIBCLANG_PATH=$clangPath"  >> $env:GITHUB_ENV
+          echo "$clangPath"               >> $env:GITHUB_PATH
 
-      # ── Paths d'environnement ────────────────────────────────────────────────
-      - name: Set LLVM and WDK paths
+      # ── WDK via NuGet ────────────────────────────────────────────────────────
+      # Microsoft utilise NuGet (pas l'installeur système) pour le WDK 10.0.26100.
+      # Les packages NuGet s'extraient dans C:\packages\ et wdk-build lit les
+      # variables d'env WDKContentRoot / WDKBinRoot / WDKToolRoot directement,
+      # ce qui évite tout conflit avec la version du SDK pré-installé sur le runner.
+      - name: Install WDK 10.0.26100 via NuGet
         shell: pwsh
         run: |
-          $llvmBin  = "C:\Program Files\LLVM\bin"
-          $kitsRoot = "${{ steps.sdk.outputs.kitsRoot }}"
+          Set-StrictMode -Version Latest
+          $ProgressPreference = 'SilentlyContinue'
 
-          # Chercher le dossier bin WDK qui contient stampinf.exe (version réelle installée)
-          $wdkBin = Get-ChildItem "${kitsRoot}bin" -Directory |
-            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-            Sort-Object Name -Descending |
-            Where-Object { Test-Path "$($_.FullName)\x64\stampinf.exe" } |
-            Select-Object -First 1 |
-            ForEach-Object { "$($_.FullName)\x64" }
+          $baseVersion    = "10.0.26100"
+          $packagesRoot   = "C:\packages"
+          $nugetApiUrl    = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/index.json"
 
-          if (-not $wdkBin) {
-            Write-Error "stampinf.exe introuvable dans Windows Kits\bin"
-            exit 1
+          # Résolution de la dernière QFE disponible pour 10.0.26100
+          Write-Host "Recherche de la dernière QFE pour WDK $baseVersion..."
+          $resp    = Invoke-RestMethod -Uri $nugetApiUrl -TimeoutSec 30
+          $version = $resp.versions |
+            Where-Object { $_ -match "^$([regex]::Escape($baseVersion))\.\d+$" } |
+            Sort-Object { [System.Version]$_ } |
+            Select-Object -Last 1
+
+          if (-not $version) { throw "Aucune version WDK $baseVersion trouvée sur NuGet" }
+          Write-Host "Version résolue : $version"
+
+          # Installation des packages NuGet WDK (x64 + ARM64 pour avoir les headers complets)
+          foreach ($pkg in @("Microsoft.Windows.WDK.x64", "Microsoft.Windows.WDK.ARM64")) {
+            Write-Host "Installation $pkg $version..."
+            nuget install $pkg -Version $version -OutputDirectory $packagesRoot -NonInteractive
+            if ($LASTEXITCODE -ne 0) { throw "Échec installation $pkg" }
           }
 
-          Write-Host "LLVM : $llvmBin"
-          Write-Host "WDK  : $wdkBin"
+          # Découverte des chemins installés
+          $pkgDirs   = Get-ChildItem $packagesRoot -Directory |
+            Where-Object { $_.Name -like "*.$baseVersion.*" }
 
-          echo "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
-          echo "$llvmBin"              >> $env:GITHUB_PATH
-          echo "$wdkBin"              >> $env:GITHUB_PATH
+          $sdkPkg    = $pkgDirs |
+            Where-Object { $_.Name -match "^Microsoft\.Windows\.SDK\.CPP\.$baseVersion(\.\d+)?$" } |
+            Select-Object -First 1
+          $wdkX64Pkg = $pkgDirs |
+            Where-Object { $_.Name -match "^Microsoft\.Windows\.WDK\.x64\.$baseVersion" } |
+            Select-Object -First 1
 
-      # ── Build ────────────────────────────────────────────────────────────────
+          if (-not $sdkPkg)    { throw "Package SDK introuvable dans $packagesRoot" }
+          if (-not $wdkX64Pkg) { throw "Package WDK x64 introuvable dans $packagesRoot" }
+
+          Write-Host "SDK  : $($sdkPkg.FullName)"
+          Write-Host "WDK  : $($wdkX64Pkg.FullName)"
+
+          # Variables d'environnement lues par wdk-build
+          $envVars = @{
+            Version_Number     = "$baseVersion.0"
+            FullVersionNumber  = $version
+            WDKContentRoot     = "$($wdkX64Pkg.FullName)\c\"
+            WDKBinRoot         = "$($wdkX64Pkg.FullName)\c\bin\$baseVersion.0"
+            WDKToolRoot        = "$($wdkX64Pkg.FullName)\c\tools\$baseVersion.0"
+            WindowsSdkBinPath  = "$($sdkPkg.FullName)\c\bin"
+            NugetPackagesRoot  = $packagesRoot
+          }
+
+          foreach ($kv in $envVars.GetEnumerator()) {
+            Write-Host "  $($kv.Key) = $($kv.Value)"
+            echo "$($kv.Key)=$($kv.Value)" >> $env:GITHUB_ENV
+          }
+
+          # Ajouter les outils WDK au PATH (stampinf, inf2cat, infverif, etc.)
+          $wdkBinX64 = "$($wdkX64Pkg.FullName)\c\bin\$baseVersion.0\x64"
+          echo "$wdkBinX64" >> $env:GITHUB_PATH
+          Write-Host "WDK bin ajouté au PATH : $wdkBinX64"
+
+      # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build driver package
         run: cargo make
 
       - name: Show sccache stats
-        run: sccache --show-stats
         if: always()
+        run: sccache --show-stats
 
-      # ── Packaging ────────────────────────────────────────────────────────────
+      # ── Packaging & Upload ────────────────────────────────────────────────────
       - name: Package artifacts
         shell: pwsh
         run: |
@@ -230,14 +168,14 @@ jobs:
           Write-Host "Contenu du package :"
           Get-ChildItem $pkg | Format-Table Name, Length
 
-      - name: Upload artifact (tous les commits)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: WazabiEDR_Agent-${{ github.sha }}
           path: WazabiEDR_Agent.zip
           retention-days: 30
 
-      - name: Create GitHub Release (tags uniquement)
+      - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:

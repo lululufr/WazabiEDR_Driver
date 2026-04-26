@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Read(//mnt/c/Users/lucas/Documents/WAZABI/**)",
-      "Read(//mnt/c/Users/lucas/Documents/WAZABI/WazabiEDR_Agent/**)"
+      "Read(//mnt/c/Users/lucas/Documents/WAZABI/WazabiEDR_Agent/**)",
+      "Bash(gh api *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
