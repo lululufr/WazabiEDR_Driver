@@ -9,8 +9,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
-  # RUSTC_WRAPPER est activé conditionnellement après vérification de sccache
 
 jobs:
   build:
@@ -27,33 +25,6 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      # sccache intercepte rustc → cache chaque unité de compilation individuellement
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.5
-
-      # Activer RUSTC_WRAPPER=sccache seulement si sccache peut faire une vraie opération cache.
-      # sccache initialise son backend GHA de façon lazy : --show-stats retourne 0 même quand
-      # le backend est défaillant. On teste avec `sccache rustc -vV`, identique au premier appel
-      # de cargo, pour détecter les erreurs GHA (HTTP 4xx/5xx) avant le build.
-      - name: Enable sccache (if available)
-        shell: pwsh
-        run: |
-          $rustcPath = (Get-Command rustc -ErrorAction Stop).Source
-
-          # Reset du daemon pour forcer une initialisation fraîche du backend GHA
-          $null = sccache --stop-server 2>&1
-
-          $test = & sccache $rustcPath -vV 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "sccache opérationnel — cache activé"
-            echo "RUSTC_WRAPPER=sccache" >> $env:GITHUB_ENV
-          } else {
-            Write-Warning "sccache non fonctionnel (GHA cache inaccessible) — build sans cache"
-            Write-Host $test
-            $null = sccache --stop-server 2>&1
-            echo "RUSTC_WRAPPER=" >> $env:GITHUB_ENV
-          }
-
       # ── Caches Cargo ─────────────────────────────────────────────────────────
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -65,6 +36,8 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-registry-
 
+      # Cache des artefacts de build : évite de recompiler les dépendances
+      # si Cargo.lock et les sources n'ont pas changé.
       - name: Cache target/
         uses: actions/cache@v4
         with:
@@ -86,14 +59,11 @@ jobs:
         with:
           tool: rust-script
 
-      # ── LLVM (bindgen) ───────────────────────────────────────────────────────
+      # ── LLVM (requis par wdk-sys/bindgen) ────────────────────────────────────
       - name: Install LLVM 17.0.6
         shell: pwsh
         run: |
           $clangPath = "C:\Program Files\LLVM\bin"
-
-          # Vérification directe du binaire — évite winget list qui déclenche
-          # les accords msstore et tente un upgrade (exit 1 si déjà à jour).
           if (Test-Path "$clangPath\clang.exe") {
             Write-Host "LLVM déjà installé : $clangPath"
           } else {
@@ -101,24 +71,23 @@ jobs:
               --accept-package-agreements --accept-source-agreements `
               --silent --disable-interactivity
           }
-
           echo "LIBCLANG_PATH=$clangPath" >> $env:GITHUB_ENV
           echo "$clangPath"              >> $env:GITHUB_PATH
 
       # ── WDK via NuGet ────────────────────────────────────────────────────────
-      # Microsoft utilise NuGet (pas l'installeur système) pour le WDK 10.0.26100.
-      # Les packages NuGet s'extraient dans C:\packages\ et wdk-build lit les
-      # variables d'env WDKContentRoot / WDKBinRoot / WDKToolRoot directement,
-      # ce qui évite tout conflit avec la version du SDK pré-installé sur le runner.
+      # Approche de microsoft/windows-drivers-rs : NuGet extrait les packages dans
+      # C:\packages\ et wdk-build lit WDKContentRoot/WDKBinRoot/WDKToolRoot directement,
+      # sans passer par le registre Windows — élimine le conflit de version avec le SDK
+      # pré-installé sur le runner (10.0.26100.0).
       - name: Install WDK 10.0.26100 via NuGet
         shell: pwsh
         run: |
           Set-StrictMode -Version Latest
           $ProgressPreference = 'SilentlyContinue'
 
-          $baseVersion    = "10.0.26100"
-          $packagesRoot   = "C:\packages"
-          $nugetApiUrl    = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/index.json"
+          $baseVersion  = "10.0.26100"
+          $packagesRoot = "C:\packages"
+          $nugetApiUrl  = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/index.json"
 
           # Résolution de la dernière QFE disponible pour 10.0.26100
           Write-Host "Recherche de la dernière QFE pour WDK $baseVersion..."
@@ -131,7 +100,7 @@ jobs:
           if (-not $version) { throw "Aucune version WDK $baseVersion trouvée sur NuGet" }
           Write-Host "Version résolue : $version"
 
-          # Installation des packages NuGet WDK (x64 + ARM64 pour avoir les headers complets)
+          # Installation des packages NuGet WDK
           foreach ($pkg in @("Microsoft.Windows.WDK.x64", "Microsoft.Windows.WDK.ARM64")) {
             Write-Host "Installation $pkg $version..."
             nuget install $pkg -Version $version -OutputDirectory $packagesRoot -NonInteractive
@@ -152,18 +121,18 @@ jobs:
           if (-not $sdkPkg)    { throw "Package SDK introuvable dans $packagesRoot" }
           if (-not $wdkX64Pkg) { throw "Package WDK x64 introuvable dans $packagesRoot" }
 
-          Write-Host "SDK  : $($sdkPkg.FullName)"
-          Write-Host "WDK  : $($wdkX64Pkg.FullName)"
+          Write-Host "SDK : $($sdkPkg.FullName)"
+          Write-Host "WDK : $($wdkX64Pkg.FullName)"
 
-          # Variables d'environnement lues par wdk-build
+          # Variables d'environnement lues par wdk-build (prioritaires sur le registre)
           $envVars = @{
-            Version_Number     = "$baseVersion.0"
-            FullVersionNumber  = $version
-            WDKContentRoot     = "$($wdkX64Pkg.FullName)\c\"
-            WDKBinRoot         = "$($wdkX64Pkg.FullName)\c\bin\$baseVersion.0"
-            WDKToolRoot        = "$($wdkX64Pkg.FullName)\c\tools\$baseVersion.0"
-            WindowsSdkBinPath  = "$($sdkPkg.FullName)\c\bin"
-            NugetPackagesRoot  = $packagesRoot
+            Version_Number    = "$baseVersion.0"
+            FullVersionNumber = $version
+            WDKContentRoot    = "$($wdkX64Pkg.FullName)\c\"
+            WDKBinRoot        = "$($wdkX64Pkg.FullName)\c\bin\$baseVersion.0"
+            WDKToolRoot       = "$($wdkX64Pkg.FullName)\c\tools\$baseVersion.0"
+            WindowsSdkBinPath = "$($sdkPkg.FullName)\c\bin"
+            NugetPackagesRoot = $packagesRoot
           }
 
           foreach ($kv in $envVars.GetEnumerator()) {
@@ -171,7 +140,6 @@ jobs:
             echo "$($kv.Key)=$($kv.Value)" >> $env:GITHUB_ENV
           }
 
-          # Ajouter les outils WDK au PATH (stampinf, inf2cat, infverif, etc.)
           $wdkBinX64 = "$($wdkX64Pkg.FullName)\c\bin\$baseVersion.0\x64"
           echo "$wdkBinX64" >> $env:GITHUB_PATH
           Write-Host "WDK bin ajouté au PATH : $wdkBinX64"
@@ -179,10 +147,6 @@ jobs:
       # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build driver package
         run: cargo make
-
-      - name: Show sccache stats
-        if: always() && env.RUSTC_WRAPPER == 'sccache'
-        run: sccache --show-stats
 
       # ── Packaging & Upload ────────────────────────────────────────────────────
       - name: Package artifacts
