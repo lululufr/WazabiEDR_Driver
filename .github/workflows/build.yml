@@ -46,15 +46,49 @@ jobs:
       - name: Install LLVM (requis par wdk-sys/bindgen)
         run: choco install llvm -y --no-progress
 
-      - name: Install Windows Driver Kit 11
-        run: choco install windowsdriverkit11 -y --no-progress
+      - name: Install WDK matching the pre-installed Windows SDK
+        shell: pwsh
+        run: |
+          # Le runner windows-latest embarque un SDK Windows (ex: 10.0.26100.0).
+          # wdk-sys/bindgen cherche les headers kernel (km/) pour cette version exacte.
+          # On installe le WDK correspondant via le téléchargement officiel Microsoft.
+
+          $kitsRoot = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots").KitsRoot10
+          $sdkVersion = Get-ChildItem "$kitsRoot\Include" -Directory |
+            Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1 -ExpandProperty Name
+
+          Write-Host "SDK détecté : $sdkVersion"
+
+          $kmPath = "${kitsRoot}Include\$sdkVersion\km"
+          if (Test-Path $kmPath) {
+            Write-Host "Headers WDK déjà présents : $kmPath"
+            exit 0
+          }
+
+          Write-Host "Téléchargement du WDK $sdkVersion ..."
+          # URL officielle Microsoft — WDK Windows 11 24H2 (10.0.26100)
+          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2249371"
+          $installer = "$env:TEMP\wdksetup.exe"
+          Invoke-WebRequest -Uri $wdkUrl -OutFile $installer -UseBasicParsing
+
+          Write-Host "Installation silencieuse du WDK ..."
+          Start-Process -Wait -FilePath $installer `
+            -ArgumentList "/quiet /norestart /features OptionId.WindowsDriverKitComplete"
+
+          if (-not (Test-Path $kmPath)) {
+            Write-Error "WDK installé mais km/ introuvable : $kmPath"
+            exit 1
+          }
+          Write-Host "WDK $sdkVersion installé avec succès"
 
       - name: Set LLVM and WDK paths
         shell: pwsh
         run: |
           $llvmBin = "C:\Program Files\LLVM\bin"
 
-          # Détection dynamique de la version WDK installée
+          # Détection dynamique de la version WDK/SDK installée
           $wdkBinRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
           $wdkVersion = Get-ChildItem $wdkBinRoot -Directory |
             Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
