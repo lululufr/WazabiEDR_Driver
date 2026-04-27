@@ -67,9 +67,14 @@ jobs:
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          winget install --id LLVM.LLVM --version 17.0.6 `
-            --accept-package-agreements --accept-source-agreements `
-            --silent --disable-interactivity
+          $clangPath = "C:\Program Files\LLVM\bin"
+          if (Test-Path "$clangPath\clang.exe") {
+            Write-Host "LLVM déjà présent : $clangPath"
+          } else {
+            winget install --id LLVM.LLVM --version 17.0.6 `
+              --accept-package-agreements --accept-source-agreements `
+              --silent --disable-interactivity
+          }
 
       - name: Configure LLVM env vars
         shell: pwsh
