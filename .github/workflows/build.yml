@@ -11,7 +11,7 @@ env:
   CARGO_TERM_COLOR: always
 
 permissions:
-  contents: write   
+  contents: write
 
 jobs:
   build:
@@ -45,7 +45,6 @@ jobs:
             ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
             ${{ runner.os }}-target-
 
-
       - name: Install cargo-make
         uses: taiki-e/install-action@v2
         with:
@@ -56,22 +55,39 @@ jobs:
         with:
           tool: rust-script
 
+      # ── LLVM ─────────────────────────────────────────────────────────────────
+      - name: Cache LLVM
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\LLVM
+          key: llvm-17.0.6
+
       - name: Install LLVM 17.0.6
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          winget install --id LLVM.LLVM --version 17.0.6 `
+            --accept-package-agreements --accept-source-agreements `
+            --silent --disable-interactivity
+
+      - name: Configure LLVM env vars
         shell: pwsh
         run: |
           $clangPath = "C:\Program Files\LLVM\bin"
-          if (Test-Path "$clangPath\clang.exe") {
-            Write-Host "LLVM déjà installé : $clangPath"
-          } else {
-            winget install --id LLVM.LLVM --version 17.0.6 `
-              --accept-package-agreements --accept-source-agreements `
-              --silent --disable-interactivity
-          }
           echo "LIBCLANG_PATH=$clangPath" >> $env:GITHUB_ENV
           echo "$clangPath"              >> $env:GITHUB_PATH
 
+      # ── WDK ──────────────────────────────────────────────────────────────────
+      - name: Cache WDK NuGet packages
+        id: cache-wdk
+        uses: actions/cache@v4
+        with:
+          path: C:\packages
+          key: wdk-10.0.26100
 
       - name: Install WDK 10.0.26100 via NuGet
+        if: steps.cache-wdk.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           Set-StrictMode -Version Latest
@@ -81,7 +97,6 @@ jobs:
           $packagesRoot = "C:\packages"
           $nugetApiUrl  = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/index.json"
 
-          # Résolution de la dernière QFE disponible pour 10.0.26100
           Write-Host "Recherche de la dernière QFE pour WDK $baseVersion..."
           $resp    = Invoke-RestMethod -Uri $nugetApiUrl -TimeoutSec 30
           $version = $resp.versions |
@@ -92,14 +107,19 @@ jobs:
           if (-not $version) { throw "Aucune version WDK $baseVersion trouvée sur NuGet" }
           Write-Host "Version résolue : $version"
 
-          # Installation des packages NuGet WDK
           foreach ($pkg in @("Microsoft.Windows.WDK.x64", "Microsoft.Windows.WDK.ARM64")) {
             Write-Host "Installation $pkg $version..."
             nuget install $pkg -Version $version -OutputDirectory $packagesRoot -NonInteractive
             if ($LASTEXITCODE -ne 0) { throw "Échec installation $pkg" }
           }
 
-          # Découverte des chemins installés
+      - name: Configure WDK env vars
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $baseVersion  = "10.0.26100"
+          $packagesRoot = "C:\packages"
+
           $pkgDirs   = Get-ChildItem $packagesRoot -Directory |
             Where-Object { $_.Name -like "*.$baseVersion.*" }
 
@@ -113,10 +133,12 @@ jobs:
           if (-not $sdkPkg)    { throw "Package SDK introuvable dans $packagesRoot" }
           if (-not $wdkX64Pkg) { throw "Package WDK x64 introuvable dans $packagesRoot" }
 
+          $version = $wdkX64Pkg.Name -replace "^Microsoft\.Windows\.WDK\.x64\.", ""
+
           Write-Host "SDK : $($sdkPkg.FullName)"
           Write-Host "WDK : $($wdkX64Pkg.FullName)"
+          Write-Host "Version : $version"
 
-          # Variables d'environnement lues par wdk-build (prioritaires sur le registre)
           $envVars = @{
             Version_Number    = "$baseVersion.0"
             FullVersionNumber = $version
