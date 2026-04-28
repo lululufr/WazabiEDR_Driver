@@ -33,17 +33,17 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-registry-
+          key: v2-${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: v2-${{ runner.os }}-cargo-registry-
 
       - name: Cache target/
         uses: actions/cache@v4
         with:
           path: target/
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**', 'build.rs') }}
+          key: v2-${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**', 'build.rs') }}
           restore-keys: |
-            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
-            ${{ runner.os }}-target-
+            v2-${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+            v2-${{ runner.os }}-target-
 
       - name: Install cargo-make
         uses: taiki-e/install-action@v2
