@@ -18,3 +18,17 @@ Requirement
   pnputil /add-driver WazabiEDR_Driver.inf /install
   pnputil /scan-devices
 ```
+
+
+---------
+
+
+todo a preciser 
+
+````
+net use Y: "\\vmware-host\Shared Folders"
+````
+
+````
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine
+````
