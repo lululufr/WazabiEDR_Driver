@@ -1,5 +1,5 @@
 [package]
-name = "WazabiEDR_Agent"
+name = "WazabiEDR_Driver"
 version = "0.1.0"
 edition = "2024"
 

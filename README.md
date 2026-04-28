@@ -15,6 +15,6 @@ Requirement
   certutil -addstore TrustedPublisher WDRLocalTestCert.cer
 
   rem Ajouter le driver au Driver Store et créer le device PnP
-  pnputil /add-driver WazabiEDR_Agent.inf /install
+  pnputil /add-driver WazabiEDR_Driver.inf /install
   pnputil /scan-devices
 ```

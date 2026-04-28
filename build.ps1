@@ -3,9 +3,9 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ServiceName = "WazabiEDR_Agent"
-$PackageDir  = Join-Path $PSScriptRoot "target\debug\WazabiEDR_Agent_package"
-$InfName     = "WazabiEDR_Agent.inf"
+$ServiceName = "WazabiEDR_Driver"
+$PackageDir  = Join-Path $PSScriptRoot "target\debug\WazabiEDR_Driver_package"
+$InfName     = "WazabiEDR_Driver.inf"
 
 function Write-Step([string]$msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok([string]$msg)   { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -100,4 +100,4 @@ if ($svc.Status -ne "Running") {
     $svc.Refresh()
 }
 
-Write-Ok "WazabiEDR Agent opérationnel. Etat : $($svc.Status)"
+Write-Ok "WazabiEDR Driver opérationnel. Etat : $($svc.Status)"

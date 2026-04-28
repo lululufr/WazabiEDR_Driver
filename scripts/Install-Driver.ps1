@@ -13,8 +13,8 @@
     Tag de release à installer. Défaut : "latest".
 
 .EXAMPLE
-    .\Install-Driver.ps1 -Repo "MonOrg/WazabiEDR_Agent" -Token "ghp_..."
-    .\Install-Driver.ps1 -Repo "MonOrg/WazabiEDR_Agent" -Tag "v1.2.0"
+    .\Install-Driver.ps1 -Repo "MonOrg/WazabiEDR_Driver" -Token "ghp_..."
+    .\Install-Driver.ps1 -Repo "MonOrg/WazabiEDR_Driver" -Tag "v1.2.0"
 #>
 [CmdletBinding()]
 param(
@@ -118,7 +118,7 @@ if (-not $tsEnabled) {
     Write-Host "  Après le redémarrage, relancez ce script pour finaliser l'installation." -ForegroundColor Yellow
     $choice = Read-Host "Redémarrer maintenant ? (o/N)"
     if ($choice -match "^[oOyY]") {
-        shutdown /r /t 10 /c "Activation testsigning pour WazabiEDR"
+        shutdown /r /t 10 /c "Activation testsigning pour WazabiEDR Driver"
     }
     exit 0
 }
@@ -135,7 +135,7 @@ if (-not $infFile) {
 }
 
 # Si le driver est déjà chargé, l'arrêter proprement avant mise à jour
-$svcName = "WazabiEDR_Agent"
+$svcName = "WazabiEDR_Driver"
 $existingSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
 if ($existingSvc -and $existingSvc.Status -eq "Running") {
     Write-Step "Arrêt du service existant '$svcName' ..."
@@ -167,7 +167,7 @@ if ($svc) {
     Write-Warn "Service '$svcName' non détecté automatiquement."
     Write-Host ""
     Write-Host "  Si devcon.exe est disponible (installé avec le WDK), exécutez :" -ForegroundColor Yellow
-    Write-Host "  devcon.exe install `"$($infFile.FullName)`" Root\WazabiEDR_Agent" -ForegroundColor White
+    Write-Host "  devcon.exe install `"$($infFile.FullName)`" Root\WazabiEDR_Driver" -ForegroundColor White
 }
 
 # ---------------------------------------------------------------------------

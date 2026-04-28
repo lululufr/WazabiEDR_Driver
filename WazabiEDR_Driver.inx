@@ -1,6 +1,6 @@
 ;
-; WazabiEDR_Agent.inx
-; Kernel-mode EDR agent driver (KMDF, root-enumerated)
+; WazabiEDR_Driver.inx
+; Kernel-mode EDR driver (KMDF, root-enumerated)
 ;
 
 [Version]
@@ -9,17 +9,17 @@ Class       = "ActivityMonitor"
 ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
 Provider    = %ManufacturerName%
 DriverVer   =
-CatalogFile = WazabiEDR_Agent.cat
+CatalogFile = WazabiEDR_Driver.cat
 PnpLockdown = 1
 
 [DestinationDirs]
-WazabiEDR_Agent.CopyFiles = 13  ; Driver Store (isolated, required for Win10 2004+)
+WazabiEDR_Driver.CopyFiles = 13  ; Driver Store (isolated, required for Win10 2004+)
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
 
 [SourceDisksFiles]
-WazabiEDR_Agent.sys = 1,,
+WazabiEDR_Driver.sys = 1,,
 
 ; ==================== OS / Architecture Targets ====================
 
@@ -27,34 +27,34 @@ WazabiEDR_Agent.sys = 1,,
 %ManufacturerName% = Standard, NT$ARCH$.10.0...16299
 
 [Standard.NT$ARCH$.10.0...16299]
-%WazabiEDR_Agent.DeviceDesc% = WazabiEDR_Agent_Device, Root\WazabiEDR_Agent
+%WazabiEDR_Driver.DeviceDesc% = WazabiEDR_Driver_Device, Root\WazabiEDR_Driver
 
 ; ==================== Installation ====================
 
-[WazabiEDR_Agent_Device.NT]
-CopyFiles = WazabiEDR_Agent.CopyFiles
+[WazabiEDR_Driver_Device.NT]
+CopyFiles = WazabiEDR_Driver.CopyFiles
 
-[WazabiEDR_Agent.CopyFiles]
-WazabiEDR_Agent.sys
+[WazabiEDR_Driver.CopyFiles]
+WazabiEDR_Driver.sys
 
 ; ==================== Service ====================
 
-[WazabiEDR_Agent_Device.NT.Services]
-AddService = WazabiEDR_Agent, %SPSVCINST_ASSOCSERVICE%, WazabiEDR_Agent_Service_Inst
+[WazabiEDR_Driver_Device.NT.Services]
+AddService = WazabiEDR_Driver, %SPSVCINST_ASSOCSERVICE%, WazabiEDR_Driver_Service_Inst
 
-[WazabiEDR_Agent_Service_Inst]
-DisplayName   = %WazabiEDR_Agent.SvcDesc%
+[WazabiEDR_Driver_Service_Inst]
+DisplayName   = %WazabiEDR_Driver.SvcDesc%
 ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
 StartType     = 1               ; SERVICE_SYSTEM_START — chargé tôt au démarrage
 ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
-ServiceBinary = %13%\WazabiEDR_Agent.sys
+ServiceBinary = %13%\WazabiEDR_Driver.sys
 
 ; ==================== WDF ====================
 
-[WazabiEDR_Agent_Device.NT.Wdf]
-KmdfService = WazabiEDR_Agent, WazabiEDR_Agent_Wdf_Inst
+[WazabiEDR_Driver_Device.NT.Wdf]
+KmdfService = WazabiEDR_Driver, WazabiEDR_Driver_Wdf_Inst
 
-[WazabiEDR_Agent_Wdf_Inst]
+[WazabiEDR_Driver_Wdf_Inst]
 KmdfLibraryVersion = $KMDFVERSION$
 
 ; ==================== Strings ====================
@@ -62,6 +62,6 @@ KmdfLibraryVersion = $KMDFVERSION$
 [Strings]
 SPSVCINST_ASSOCSERVICE        = 0x00000002
 ManufacturerName              = "Wazabi Security"
-DiskName                      = "WazabiEDR Agent Installation Disk"
-WazabiEDR_Agent.DeviceDesc    = "Wazabi EDR Agent"
-WazabiEDR_Agent.SvcDesc       = "Wazabi EDR Agent Service"
+DiskName                      = "WazabiEDR Driver Installation Disk"
+WazabiEDR_Driver.DeviceDesc   = "Wazabi EDR Driver"
+WazabiEDR_Driver.SvcDesc      = "Wazabi EDR Driver Service"

@@ -1,4 +1,4 @@
-name: Build WazabiEDR Agent
+name: Build WazabiEDR Driver
 
 on:
   push:
@@ -33,17 +33,17 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-registry-
+          key: v2-${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: v2-${{ runner.os }}-cargo-registry-
 
       - name: Cache target/
         uses: actions/cache@v4
         with:
           path: target/
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**', 'build.rs') }}
+          key: v2-${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**', 'build.rs') }}
           restore-keys: |
-            ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
-            ${{ runner.os }}-target-
+            v2-${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-
+            v2-${{ runner.os }}-target-
 
       - name: Install cargo-make
         uses: taiki-e/install-action@v2
@@ -163,31 +163,24 @@ jobs:
           echo "$wdkBinX64" >> $env:GITHUB_PATH
           Write-Host "WDK bin ajouté au PATH : $wdkBinX64"
 
-      # ── sccache ───────────────────────────────────────────────────────────────
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build driver package
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_GHA_ENABLED: "true"
         run: cargo make
 
       # ── Packaging & Upload ────────────────────────────────────────────────────
       - name: Package artifacts
         shell: pwsh
         run: |
-          $pkg = "target\debug\WazabiEDR_Agent_package"
-          Compress-Archive -Path "$pkg\*" -DestinationPath "WazabiEDR_Agent.zip" -Force
+          $pkg = "target\debug\WazabiEDR_Driver_package"
+          Compress-Archive -Path "$pkg\*" -DestinationPath "WazabiEDR_Driver.zip" -Force
           Write-Host "Contenu du package :"
           Get-ChildItem $pkg | Format-Table Name, Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WazabiEDR_Agent-${{ github.sha }}
-          path: WazabiEDR_Agent.zip
+          name: WazabiEDR_Driver-${{ github.sha }}
+          path: WazabiEDR_Driver.zip
           retention-days: 30
 
 
@@ -207,7 +200,7 @@ jobs:
           allowUpdates: true
           removeArtifacts: true
           makeLatest: false
-          artifacts: WazabiEDR_Agent.zip
+          artifacts: WazabiEDR_Driver.zip
           body: |
             Build automatique depuis `master`.
             **Commit :** `${{ github.sha }}`
@@ -224,6 +217,6 @@ jobs:
           removeArtifacts: true
           generateReleaseNotes: true
           makeLatest: true
-          artifacts: WazabiEDR_Agent.zip
+          artifacts: WazabiEDR_Driver.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
