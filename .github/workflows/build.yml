@@ -1,11 +1,8 @@
 name: Build WazabiEDR Driver
 
 on:
-  push:
-    branches: [master, main]
-    tags: ["v*.*.*"]
   pull_request:
-    branches: [master, main]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
