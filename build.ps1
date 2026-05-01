@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Installe le driver WazabiEDR sur la VM cible.
@@ -22,6 +22,7 @@ $ErrorActionPreference = "Stop"
 
 $ServiceName = "WazabiEDR_Driver"
 $InfName     = "WazabiEDR_Driver.inf"
+$HardwareId  = "Root\WazabiEDR_Driver"
 
 function Write-Step([string]$msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok  ([string]$msg) { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -52,13 +53,35 @@ if (-not $tsEnabled) {
 }
 Write-Ok "Test signing actif."
 
+# ── 2bis. Localisation de devcon.exe ─────────────────────────────────────────
+# pnputil /add-driver /install ne crée pas de device root-enumerated.
+# devcon.exe (livré avec le WDK) est nécessaire pour instancier Root\WazabiEDR_Driver.
+$arch = if ([Environment]::Is64BitOperatingSystem) {
+    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+} else { "x86" }
+
+$devcon = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Tools" `
+    -Filter "devcon.exe" -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -match "\\$arch\\" } |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
+
+if (-not $devcon) {
+    Write-Fail "devcon.exe ($arch) introuvable dans le WDK. Installez le Windows Driver Kit."
+}
+Write-Ok "devcon: $devcon"
+
 # ── 3. Détection et suppression d'une installation précédente ────────────────
-Write-Step "Recherche d'une installation précédente..."
+$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($svc) {
+    Write-Step "Mode: REDÉPLOIEMENT À CHAUD (service existant détecté, pas de reboot requis)."
+} else {
+    Write-Step "Mode: PREMIÈRE INSTALLATION."
+}
 
 $hadOldInstall = $false
 
-# 3a. Arrêt du service si présent
-$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+# 3a. Arrêt du service si présent (déchargement du driver de la mémoire kernel)
 if ($svc) {
     $hadOldInstall = $true
     if ($svc.Status -ne "Stopped") {
@@ -66,8 +89,33 @@ if ($svc) {
         try {
             Stop-Service -Name $ServiceName -Force -ErrorAction Stop
             Start-Sleep -Seconds 2
+            Write-Ok "Service arrêté — driver déchargé."
         } catch {
-            Write-Warn "Impossible d'arrêter le service proprement: $_"
+            Write-Host ""
+            Write-Host "Stop-Service a échoué : $_" -ForegroundColor Red
+            Write-Host "  Cause : le driver actuellement chargé n'implémente pas DriverUnload." -ForegroundColor Yellow
+            Write-Host "  Il ne peut être retiré qu'au reboot." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "  Procédure de recovery (one-shot) :" -ForegroundColor Cyan
+
+            $disabled = $false
+            try {
+                & sc.exe config $ServiceName start= disabled | Out-Null
+                if ($LASTEXITCODE -eq 0) { $disabled = $true }
+            } catch {}
+
+            if ($disabled) {
+                Write-Ok "  Service '$ServiceName' désactivé au boot (sc config start= disabled)."
+                Write-Host "  → Redémarrez la VM (Restart-Computer), puis relancez ce script." -ForegroundColor Cyan
+                Write-Host "    Le driver ne se chargera plus au boot, build.ps1 pourra alors" -ForegroundColor Cyan
+                Write-Host "    installer la nouvelle version (avec DriverUnload)." -ForegroundColor Cyan
+                Write-Host "    Toutes les itérations suivantes seront à chaud." -ForegroundColor Cyan
+            } else {
+                Write-Host "    sc config start= disabled" -ForegroundColor White
+                Write-Host "    Restart-Computer" -ForegroundColor White
+                Write-Host "    .\build.ps1" -ForegroundColor White
+            }
+            exit 1
         }
     } else {
         Write-Step "Service '$ServiceName' déjà arrêté."
@@ -116,24 +164,23 @@ if ($certFile) {
 }
 
 # ── 5. Installation du nouveau driver ────────────────────────────────────────
-Write-Step "Installation du driver: $infPath"
-pnputil /add-driver $infPath /install
+Write-Step "Ajout du package au Driver Store: $infPath"
+pnputil /add-driver $infPath
 if ($LASTEXITCODE -ne 0) {
     Write-Fail "pnputil /add-driver a échoué (exit $LASTEXITCODE)"
 }
 
-Write-Step "Énumération PnP (instanciation du device racine)..."
-pnputil /scan-devices | Out-Null
-Start-Sleep -Seconds 3
+Write-Step "Création du device root '$HardwareId' via devcon..."
+& $devcon install $infPath $HardwareId
+if ($LASTEXITCODE -ne 0) {
+    Write-Fail "devcon install a échoué (exit $LASTEXITCODE)"
+}
+Start-Sleep -Seconds 2
 
 # ── 6. Démarrage du service ──────────────────────────────────────────────────
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if (-not $svc) {
-    Write-Warn "Service '$ServiceName' non détecté après installation."
-    Write-Host "  Le device root n'a pas été énuméré. Essayez:" -ForegroundColor Yellow
-    Write-Host "    pnputil /scan-devices" -ForegroundColor White
-    Write-Host "  ou redémarrez la VM." -ForegroundColor Yellow
-    exit 1
+    Write-Fail "Service '$ServiceName' non détecté après devcon install. Vérifiez les logs Setup (C:\Windows\INF\setupapi.dev.log)."
 }
 
 if ($svc.Status -ne "Running") {

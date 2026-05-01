@@ -45,7 +45,7 @@ AddService = WazabiEDR_Driver, %SPSVCINST_ASSOCSERVICE%, WazabiEDR_Driver_Servic
 [WazabiEDR_Driver_Service_Inst]
 DisplayName   = %WazabiEDR_Driver.SvcDesc%
 ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
-StartType     = 1               ; SERVICE_SYSTEM_START — chargé tôt au démarrage
+StartType     = 3               ; SERVICE_DEMAND_START — chargé/déchargé à la demande (dev)
 ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary = %13%\WazabiEDR_Driver.sys
 
