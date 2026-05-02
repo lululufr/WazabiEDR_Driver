@@ -1,7 +1,7 @@
 //! Producer side of the event queue.
 //!
 //! `submit_event` is the single entry point used by every kernel callback
-//! (process notify today, registry / image-load tomorrow). It hides the
+//! (process notify today, registry / thread create tomorrow). It hides the
 //! "is anyone waiting? if so, complete directly; otherwise enqueue" choice
 //! from the callbacks themselves.
 
@@ -9,15 +9,14 @@ use core::ptr;
 use core::sync::atomic::Ordering;
 
 use wdk_sys::{
-    ntddk::{
-        ExAllocatePool2, ExFreePool, KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock,
-    },
-    KIRQL, KSPIN_LOCK, POOL_FLAG_NON_PAGED, PVOID, STATUS_BUFFER_TOO_SMALL, STATUS_SUCCESS,
+    ntddk::{ExAllocatePool2, ExFreePool},
+    KSPIN_LOCK, POOL_FLAG_NON_PAGED, PVOID, STATUS_BUFFER_TOO_SMALL, STATUS_SUCCESS,
 };
 
 use crate::ipc::irp::{complete_irp, current_stack_location};
 use crate::queue::ring::queue_push_locked;
 use crate::state::{DROP_COUNT, PENDING_IRP, POOL_TAG, QUEUE_LOCK};
+use crate::util::SpinLockGuard;
 
 /// Allocate a non-paged buffer to hold an outgoing event.
 ///
@@ -33,9 +32,9 @@ pub unsafe fn alloc_event(size: u32) -> *mut u8 {
 /// Submit a fully-built event buffer to userland.
 ///
 /// Behaviour:
-/// 1. If an agent IOCTL is currently pending and its output buffer is large
-///    enough → copy directly into the user buffer and complete the IRP.
-///    The event never touches the queue (the fastest path).
+/// 1. If an agent IOCTL is currently pending and its output buffer is
+///    large enough → copy directly into the user buffer and complete the
+///    IRP. The event never touches the queue (the fastest path).
 /// 2. If the agent's buffer is too small → fail that IRP with
 ///    `STATUS_BUFFER_TOO_SMALL`, drop this event, and bump `DROP_COUNT`.
 ///    The agent will retry with a larger buffer.
@@ -46,8 +45,7 @@ pub unsafe fn alloc_event(size: u32) -> *mut u8 {
 /// caller must NOT touch the buffer after calling.
 pub unsafe fn submit_event(data: *mut u8, size: u32) {
     unsafe {
-        let irql: KIRQL =
-            KeAcquireSpinLockRaiseToDpc(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK);
+        let guard = SpinLockGuard::acquire(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK);
 
         // Take ownership of any pending IRP up-front. Either we'll satisfy
         // it (success), fail it (buffer-too-small), or put nothing back.
@@ -62,7 +60,10 @@ pub unsafe fn submit_event(data: *mut u8, size: u32) {
                 let sysbuf = (*pending).AssociatedIrp.SystemBuffer as *mut u8;
                 ptr::copy_nonoverlapping(data, sysbuf, size as usize);
 
-                KeReleaseSpinLock(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK, irql);
+                // Drop lock BEFORE IofCompleteRequest: completion routines
+                // can run synchronously and we don't want to hold the
+                // spinlock across them.
+                drop(guard);
                 ExFreePool(data as PVOID);
                 complete_irp(pending, STATUS_SUCCESS, size as usize);
                 return;
@@ -70,15 +71,14 @@ pub unsafe fn submit_event(data: *mut u8, size: u32) {
 
             // Path 2: buffer too small. Tell the agent the size it needs;
             // drop the event so the agent can re-issue.
-            KeReleaseSpinLock(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK, irql);
+            drop(guard);
             ExFreePool(data as PVOID);
             DROP_COUNT.fetch_add(1, Ordering::Relaxed);
             complete_irp(pending, STATUS_BUFFER_TOO_SMALL, size as usize);
             return;
         }
 
-        // Path 3: no agent waiting → enqueue.
+        // Path 3: no agent waiting → enqueue. `guard` releases on scope exit.
         queue_push_locked(data, size);
-        KeReleaseSpinLock(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK, irql);
     }
 }

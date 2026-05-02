@@ -7,15 +7,15 @@ use core::ptr;
 use core::sync::atomic::Ordering;
 
 use wdk_sys::{
-    ntddk::{ExFreePool, KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock},
-    KIRQL, KSPIN_LOCK, NTSTATUS, PIRP, PVOID, STATUS_BUFFER_TOO_SMALL, STATUS_CANCELLED,
-    STATUS_INVALID_DEVICE_REQUEST, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    ntddk::ExFreePool, KSPIN_LOCK, NTSTATUS, PIRP, PVOID, STATUS_BUFFER_TOO_SMALL,
+    STATUS_CANCELLED, STATUS_INVALID_DEVICE_REQUEST, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
 };
 
-use crate::ipc::irp::{complete_irp, current_stack_location, mark_irp_pending};
 use crate::ipc::IOCTL_WEDR_GET_EVENT;
+use crate::ipc::irp::{complete_irp, current_stack_location, mark_irp_pending};
 use crate::queue::ring::queue_pop_locked;
 use crate::state::{DROP_COUNT, PENDING_IRP, QUEUE_LOCK};
+use crate::util::SpinLockGuard;
 
 /// `IRP_MJ_CREATE` / `IRP_MJ_CLOSE` — the agent opens or closes the handle.
 /// Nothing to do on either side, just succeed.
@@ -65,12 +65,13 @@ pub unsafe extern "C" fn dispatch_device_control(
             return complete_irp(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
         }
 
-        let irql: KIRQL =
-            KeAcquireSpinLockRaiseToDpc(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK);
+        let guard = SpinLockGuard::acquire(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK);
 
         // ── Fast path: drain a queued event. ────────────────────────────
         if let Some(slot) = queue_pop_locked() {
-            KeReleaseSpinLock(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK, irql);
+            // Drop lock BEFORE IofCompleteRequest (completion routines run
+            // at PASSIVE/APC level — must not hold a DPC-level spinlock).
+            drop(guard);
 
             if outlen < slot.size {
                 // Agent's buffer too small — drop the event (it would be
@@ -96,7 +97,7 @@ pub unsafe extern "C" fn dispatch_device_control(
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        KeReleaseSpinLock(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK, irql);
+        drop(guard);
 
         if prev.is_err() {
             return complete_irp(irp, STATUS_UNSUCCESSFUL, 0);
