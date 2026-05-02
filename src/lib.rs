@@ -51,14 +51,12 @@ use core::sync::atomic::Ordering;
 use wdk_sys::{
     ntddk::{
         DbgPrint, ExFreePool, IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice,
-        IoDeleteSymbolicLink, KeAcquireSpinLockRaiseToDpc, KeInitializeSpinLock,
-        KeReleaseSpinLock, PsRemoveLoadImageNotifyRoutine, PsSetCreateProcessNotifyRoutineEx,
-        PsSetLoadImageNotifyRoutine, RtlInitUnicodeString,
+        IoDeleteSymbolicLink, KeInitializeSpinLock, PsRemoveLoadImageNotifyRoutine,
+        PsSetCreateProcessNotifyRoutineEx, PsSetLoadImageNotifyRoutine, RtlInitUnicodeString,
     },
     DO_BUFFERED_IO, FILE_DEVICE_UNKNOWN, IRP_MJ_CLEANUP, IRP_MJ_CLOSE, IRP_MJ_CREATE,
-    IRP_MJ_DEVICE_CONTROL, IRP_MJ_MAXIMUM_FUNCTION, KIRQL, KSPIN_LOCK, NTSTATUS,
-    PCUNICODE_STRING, PDEVICE_OBJECT, PDRIVER_OBJECT, PVOID, STATUS_CANCELLED, STATUS_SUCCESS,
-    UNICODE_STRING,
+    IRP_MJ_DEVICE_CONTROL, IRP_MJ_MAXIMUM_FUNCTION, KSPIN_LOCK, NTSTATUS, PCUNICODE_STRING,
+    PDEVICE_OBJECT, PDRIVER_OBJECT, PVOID, STATUS_CANCELLED, STATUS_SUCCESS, UNICODE_STRING,
 };
 
 use crate::callbacks::image::image_load_notify;
@@ -72,7 +70,7 @@ use crate::state::{
     CONTROL_DEVICE, IMAGE_CALLBACK_REGISTERED, PENDING_IRP, PROCESS_CALLBACK_REGISTERED,
     QUEUE_LOCK,
 };
-use crate::util::wstr16;
+use crate::util::{SpinLockGuard, wstr16};
 
 /// Kernel-internal device name. Created by `IoCreateDevice`.
 const DEVICE_NAME: &[u8; 18] = b"\\Device\\WazabiEDR\0";
@@ -218,13 +216,14 @@ unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
             complete_irp(pending, STATUS_CANCELLED, 0);
         }
 
-        // 3. Drain whatever is left in the queue.
-        let irql: KIRQL =
-            KeAcquireSpinLockRaiseToDpc(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK);
-        while let Some(slot) = queue_pop_locked() {
-            ExFreePool(slot.data as PVOID);
+        // 3. Drain whatever is left in the queue. Scoped block so the
+        //    lock is released before we touch the device namespace below.
+        {
+            let _guard = SpinLockGuard::acquire(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK);
+            while let Some(slot) = queue_pop_locked() {
+                ExFreePool(slot.data as PVOID);
+            }
         }
-        KeReleaseSpinLock(QUEUE_LOCK.as_mut_ptr() as *mut KSPIN_LOCK, irql);
 
         // 4. Symlink first (userland namespace), then device.
         let mut symlink: UNICODE_STRING = core::mem::zeroed();
