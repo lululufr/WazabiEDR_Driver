@@ -50,27 +50,42 @@ use core::sync::atomic::Ordering;
 ///Export of WINapi function available in WDK
 use wdk_sys::{
     ntddk::{
-        DbgPrint, ExFreePool, IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice,
-        IoDeleteSymbolicLink, KeInitializeSpinLock, PsRemoveLoadImageNotifyRoutine,
-        PsSetCreateProcessNotifyRoutineEx, PsSetLoadImageNotifyRoutine, RtlInitUnicodeString,
+        CmRegisterCallback, CmUnRegisterCallback, DbgPrint, ExFreePool, IoCreateDevice,
+        IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink, KeInitializeSpinLock,
+        ObRegisterCallbacks, ObUnRegisterCallbacks, PsRemoveCreateThreadNotifyRoutine,
+        PsRemoveLoadImageNotifyRoutine, PsSetCreateProcessNotifyRoutineEx,
+        PsSetCreateThreadNotifyRoutine, PsSetLoadImageNotifyRoutine, RtlInitUnicodeString,
     },
     DO_BUFFERED_IO, FILE_DEVICE_UNKNOWN, IRP_MJ_CLEANUP, IRP_MJ_CLOSE, IRP_MJ_CREATE,
-    IRP_MJ_DEVICE_CONTROL, IRP_MJ_MAXIMUM_FUNCTION, KSPIN_LOCK, NTSTATUS, PCUNICODE_STRING,
-    PDEVICE_OBJECT, PDRIVER_OBJECT, PVOID, STATUS_CANCELLED, STATUS_SUCCESS, UNICODE_STRING,
+    IRP_MJ_DEVICE_CONTROL, IRP_MJ_MAXIMUM_FUNCTION, KSPIN_LOCK, LARGE_INTEGER, NTSTATUS,
+    OB_CALLBACK_REGISTRATION, OB_FLT_REGISTRATION_VERSION, OB_OPERATION_HANDLE_CREATE,
+    OB_OPERATION_HANDLE_DUPLICATE, OB_OPERATION_REGISTRATION, PCUNICODE_STRING, PDEVICE_OBJECT,
+    PDRIVER_OBJECT, PVOID, PsProcessType, STATUS_CANCELLED, STATUS_SUCCESS, UNICODE_STRING,
 };
 
 use crate::callbacks::image::image_load_notify;
+use crate::callbacks::object::process_object_notify;
 use crate::callbacks::process::process_notify;
+use crate::callbacks::registry::registry_notify;
+use crate::callbacks::thread::thread_notify;
 use crate::ipc::dispatch::{
     dispatch_cleanup, dispatch_create_close, dispatch_device_control, dispatch_invalid,
 };
 use crate::ipc::irp::complete_irp;
 use crate::queue::ring::queue_pop_locked;
 use crate::state::{
-    CONTROL_DEVICE, IMAGE_CALLBACK_REGISTERED, PENDING_IRP, PROCESS_CALLBACK_REGISTERED,
-    QUEUE_LOCK,
+    CONTROL_DEVICE, IMAGE_CALLBACK_REGISTERED, OBJECT_CALLBACK_HANDLE, PENDING_IRP,
+    PROCESS_CALLBACK_REGISTERED, QUEUE_LOCK, REGISTRY_CALLBACK_COOKIE,
+    REGISTRY_CALLBACK_REGISTERED, THREAD_CALLBACK_REGISTERED,
 };
 use crate::util::{SpinLockGuard, wstr16};
+
+/// Altitude string used when registering object callbacks.
+///
+/// Microsoft assigns altitude ranges to vendors; in the absence of a real
+/// allocation we pick a value in the dev/test band (320000-329999) used
+/// by Microsoft's own WDK samples.
+const OB_ALTITUDE: &[u8; 7] = b"321000\0";
 
 /// Kernel-internal device name. Created by `IoCreateDevice`.
 const DEVICE_NAME: &[u8; 18] = b"\\Device\\WazabiEDR\0";
@@ -165,9 +180,8 @@ pub unsafe extern "system" fn driver_entry(
         PROCESS_CALLBACK_REGISTERED.store(true, Ordering::Release);
 
         // ── 6. Register the image-load callback. ────────────────────────
-        // Same caveat as above: must be the LAST fallible step. On failure
-        // we unwind both the process callback (registered above) and the
-        // device + symlink.
+        // Same caveat as the process callback: once it's live, the routine
+        // can run on another CPU, so any later failure must unwind it.
         let status = PsSetLoadImageNotifyRoutine(Some(image_load_notify));
         if status < 0 {
             DbgPrint(c"[WazabiEDR] PsSetLoadImageNotifyRoutine failed\n".as_ptr());
@@ -180,8 +194,98 @@ pub unsafe extern "system" fn driver_entry(
         }
         IMAGE_CALLBACK_REGISTERED.store(true, Ordering::Release);
 
+        // ── 7. Register the registry-modification callback. ─────────────
+        // CmRegisterCallback returns a cookie via out-parameter; we stash
+        // its `QuadPart` in a static atomic so DriverUnload can rebuild
+        // the LARGE_INTEGER and call CmUnRegisterCallback.
+        let mut cookie: LARGE_INTEGER = core::mem::zeroed();
+        let status = CmRegisterCallback(Some(registry_notify), ptr::null_mut(), &mut cookie);
+        if status < 0 {
+            DbgPrint(c"[WazabiEDR] CmRegisterCallback failed\n".as_ptr());
+            let _ = PsRemoveLoadImageNotifyRoutine(Some(image_load_notify));
+            IMAGE_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
+            PROCESS_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = IoDeleteSymbolicLink(&mut symlink);
+            IoDeleteDevice(device);
+            CONTROL_DEVICE.store(ptr::null_mut(), Ordering::Release);
+            return status;
+        }
+        REGISTRY_CALLBACK_COOKIE.store(cookie.QuadPart, Ordering::Release);
+        REGISTRY_CALLBACK_REGISTERED.store(true, Ordering::Release);
+
+        // ── 8. Register the thread create/exit callback. ────────────────
+        // Tiny callback (three u32s per event); cheap relative to all the
+        // others. Must still be unwound if anything later fails.
+        let status = PsSetCreateThreadNotifyRoutine(Some(thread_notify));
+        if status < 0 {
+            DbgPrint(c"[WazabiEDR] PsSetCreateThreadNotifyRoutine failed\n".as_ptr());
+            let cookie_undo = LARGE_INTEGER {
+                QuadPart: REGISTRY_CALLBACK_COOKIE.load(Ordering::Acquire),
+            };
+            let _ = CmUnRegisterCallback(cookie_undo);
+            REGISTRY_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = PsRemoveLoadImageNotifyRoutine(Some(image_load_notify));
+            IMAGE_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
+            PROCESS_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = IoDeleteSymbolicLink(&mut symlink);
+            IoDeleteDevice(device);
+            CONTROL_DEVICE.store(ptr::null_mut(), Ordering::Release);
+            return status;
+        }
+        THREAD_CALLBACK_REGISTERED.store(true, Ordering::Release);
+
+        // ── 9. Register the object-handle access callback. ──────────────
+        // This is the most fiddly registration: we have to hand the OB
+        // manager a small array of `OB_OPERATION_REGISTRATION` plus a
+        // `OB_CALLBACK_REGISTRATION` envelope, all by pointer. Stack-
+        // allocated is fine — `ObRegisterCallbacks` copies what it needs.
+        //
+        // We hook on `PsProcessType` only (handles into processes). One
+        // entry registers both CREATE and DUPLICATE.
+        let mut altitude: UNICODE_STRING = core::mem::zeroed();
+        let altitude_buf: [u16; 7] = wstr16(OB_ALTITUDE);
+        RtlInitUnicodeString(&mut altitude, altitude_buf.as_ptr());
+
+        let mut op_reg: OB_OPERATION_REGISTRATION = core::mem::zeroed();
+        op_reg.ObjectType = PsProcessType;
+        op_reg.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+        op_reg.PreOperation = Some(process_object_notify);
+        op_reg.PostOperation = None;
+
+        let mut cb_reg: OB_CALLBACK_REGISTRATION = core::mem::zeroed();
+        cb_reg.Version = OB_FLT_REGISTRATION_VERSION as u16;
+        cb_reg.OperationRegistrationCount = 1;
+        cb_reg.Altitude = altitude;
+        cb_reg.RegistrationContext = ptr::null_mut();
+        cb_reg.OperationRegistration = &mut op_reg;
+
+        let mut handle: PVOID = ptr::null_mut();
+        let status = ObRegisterCallbacks(&mut cb_reg, &mut handle);
+        if status < 0 {
+            DbgPrint(c"[WazabiEDR] ObRegisterCallbacks failed\n".as_ptr());
+            let _ = PsRemoveCreateThreadNotifyRoutine(Some(thread_notify));
+            THREAD_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let cookie_undo = LARGE_INTEGER {
+                QuadPart: REGISTRY_CALLBACK_COOKIE.load(Ordering::Acquire),
+            };
+            let _ = CmUnRegisterCallback(cookie_undo);
+            REGISTRY_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = PsRemoveLoadImageNotifyRoutine(Some(image_load_notify));
+            IMAGE_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
+            PROCESS_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = IoDeleteSymbolicLink(&mut symlink);
+            IoDeleteDevice(device);
+            CONTROL_DEVICE.store(ptr::null_mut(), Ordering::Release);
+            return status;
+        }
+        OBJECT_CALLBACK_HANDLE.store(handle as *mut core::ffi::c_void, Ordering::Release);
+
         DbgPrint(
-            c"[WazabiEDR] ready (\\\\.\\WazabiEDR + ProcessNotify + ImageLoadNotify)\n".as_ptr(),
+            c"[WazabiEDR] ready (\\\\.\\WazabiEDR + Process/Image/Registry/Thread/Object notifies)\n"
+                .as_ptr(),
         );
     }
 
@@ -203,11 +307,28 @@ unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
         // 1. Deregister callbacks. Each one has its own flag so we never
         //    double-remove (which would bug-check). Second arg of
         //    PsSetCreateProcessNotifyRoutineEx is `Remove` (TRUE = remove).
-        if PROCESS_CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
-            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
+        //    Order is roughly reverse-of-registration so a callback we're
+        //    about to free can never observe partial teardown of others.
+        let obj_handle = OBJECT_CALLBACK_HANDLE.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !obj_handle.is_null() {
+            ObUnRegisterCallbacks(obj_handle as PVOID);
+        }
+        if THREAD_CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
+            let _ = PsRemoveCreateThreadNotifyRoutine(Some(thread_notify));
+        }
+        if REGISTRY_CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
+            // Reconstruct the LARGE_INTEGER from its stored QuadPart —
+            // CmUnRegisterCallback takes the cookie BY VALUE.
+            let cookie = LARGE_INTEGER {
+                QuadPart: REGISTRY_CALLBACK_COOKIE.load(Ordering::Acquire),
+            };
+            let _ = CmUnRegisterCallback(cookie);
         }
         if IMAGE_CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
             let _ = PsRemoveLoadImageNotifyRoutine(Some(image_load_notify));
+        }
+        if PROCESS_CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
+            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
         }
 
         // 2. Cancel a still-pending IRP (the agent might be blocked).
