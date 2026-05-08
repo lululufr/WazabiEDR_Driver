@@ -10,7 +10,7 @@
 
 use core::mem::MaybeUninit;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32};
 
 use wdk_sys::KSPIN_LOCK;
 
@@ -82,3 +82,15 @@ pub static PROCESS_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// `true` once `PsSetLoadImageNotifyRoutine` has been called successfully.
 /// Same rationale as `PROCESS_CALLBACK_REGISTERED`.
 pub static IMAGE_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// `true` once `CmRegisterCallback` has been called successfully. Used by
+/// `DriverUnload` to decide whether to call `CmUnRegisterCallback`.
+/// Same double-deregister hazard applies as the other flags above.
+pub static REGISTRY_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Cookie returned by `CmRegisterCallback`. Stored as `i64` because that
+/// is the underlying representation of `LARGE_INTEGER::QuadPart`; we
+/// reconstruct a fresh `LARGE_INTEGER` whenever we need to call into CM.
+///
+/// Only meaningful when `REGISTRY_CALLBACK_REGISTERED` is true.
+pub static REGISTRY_CALLBACK_COOKIE: AtomicI64 = AtomicI64::new(0);

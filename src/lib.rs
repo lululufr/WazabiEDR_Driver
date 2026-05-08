@@ -50,17 +50,20 @@ use core::sync::atomic::Ordering;
 ///Export of WINapi function available in WDK
 use wdk_sys::{
     ntddk::{
-        DbgPrint, ExFreePool, IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice,
-        IoDeleteSymbolicLink, KeInitializeSpinLock, PsRemoveLoadImageNotifyRoutine,
-        PsSetCreateProcessNotifyRoutineEx, PsSetLoadImageNotifyRoutine, RtlInitUnicodeString,
+        CmRegisterCallback, CmUnRegisterCallback, DbgPrint, ExFreePool, IoCreateDevice,
+        IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink, KeInitializeSpinLock,
+        PsRemoveLoadImageNotifyRoutine, PsSetCreateProcessNotifyRoutineEx,
+        PsSetLoadImageNotifyRoutine, RtlInitUnicodeString,
     },
     DO_BUFFERED_IO, FILE_DEVICE_UNKNOWN, IRP_MJ_CLEANUP, IRP_MJ_CLOSE, IRP_MJ_CREATE,
-    IRP_MJ_DEVICE_CONTROL, IRP_MJ_MAXIMUM_FUNCTION, KSPIN_LOCK, NTSTATUS, PCUNICODE_STRING,
-    PDEVICE_OBJECT, PDRIVER_OBJECT, PVOID, STATUS_CANCELLED, STATUS_SUCCESS, UNICODE_STRING,
+    IRP_MJ_DEVICE_CONTROL, IRP_MJ_MAXIMUM_FUNCTION, KSPIN_LOCK, LARGE_INTEGER, NTSTATUS,
+    PCUNICODE_STRING, PDEVICE_OBJECT, PDRIVER_OBJECT, PVOID, STATUS_CANCELLED, STATUS_SUCCESS,
+    UNICODE_STRING,
 };
 
 use crate::callbacks::image::image_load_notify;
 use crate::callbacks::process::process_notify;
+use crate::callbacks::registry::registry_notify;
 use crate::ipc::dispatch::{
     dispatch_cleanup, dispatch_create_close, dispatch_device_control, dispatch_invalid,
 };
@@ -68,7 +71,7 @@ use crate::ipc::irp::complete_irp;
 use crate::queue::ring::queue_pop_locked;
 use crate::state::{
     CONTROL_DEVICE, IMAGE_CALLBACK_REGISTERED, PENDING_IRP, PROCESS_CALLBACK_REGISTERED,
-    QUEUE_LOCK,
+    QUEUE_LOCK, REGISTRY_CALLBACK_COOKIE, REGISTRY_CALLBACK_REGISTERED,
 };
 use crate::util::{SpinLockGuard, wstr16};
 
@@ -165,9 +168,8 @@ pub unsafe extern "system" fn driver_entry(
         PROCESS_CALLBACK_REGISTERED.store(true, Ordering::Release);
 
         // ── 6. Register the image-load callback. ────────────────────────
-        // Same caveat as above: must be the LAST fallible step. On failure
-        // we unwind both the process callback (registered above) and the
-        // device + symlink.
+        // Same caveat as the process callback: once it's live, the routine
+        // can run on another CPU, so any later failure must unwind it.
         let status = PsSetLoadImageNotifyRoutine(Some(image_load_notify));
         if status < 0 {
             DbgPrint(c"[WazabiEDR] PsSetLoadImageNotifyRoutine failed\n".as_ptr());
@@ -180,8 +182,31 @@ pub unsafe extern "system" fn driver_entry(
         }
         IMAGE_CALLBACK_REGISTERED.store(true, Ordering::Release);
 
+        // ── 7. Register the registry-modification callback. ─────────────
+        // CmRegisterCallback returns a cookie via out-parameter; we stash
+        // its `QuadPart` in a static atomic so DriverUnload can rebuild
+        // the LARGE_INTEGER and call CmUnRegisterCallback. As before this
+        // must be the LAST fallible step — on failure we unwind every
+        // previous step in reverse order.
+        let mut cookie: LARGE_INTEGER = core::mem::zeroed();
+        let status = CmRegisterCallback(Some(registry_notify), ptr::null_mut(), &mut cookie);
+        if status < 0 {
+            DbgPrint(c"[WazabiEDR] CmRegisterCallback failed\n".as_ptr());
+            let _ = PsRemoveLoadImageNotifyRoutine(Some(image_load_notify));
+            IMAGE_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
+            PROCESS_CALLBACK_REGISTERED.store(false, Ordering::Release);
+            let _ = IoDeleteSymbolicLink(&mut symlink);
+            IoDeleteDevice(device);
+            CONTROL_DEVICE.store(ptr::null_mut(), Ordering::Release);
+            return status;
+        }
+        REGISTRY_CALLBACK_COOKIE.store(cookie.QuadPart, Ordering::Release);
+        REGISTRY_CALLBACK_REGISTERED.store(true, Ordering::Release);
+
         DbgPrint(
-            c"[WazabiEDR] ready (\\\\.\\WazabiEDR + ProcessNotify + ImageLoadNotify)\n".as_ptr(),
+            c"[WazabiEDR] ready (\\\\.\\WazabiEDR + ProcessNotify + ImageLoadNotify + RegistryNotify)\n"
+                .as_ptr(),
         );
     }
 
@@ -208,6 +233,14 @@ unsafe extern "C" fn driver_unload(_driver: PDRIVER_OBJECT) {
         }
         if IMAGE_CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
             let _ = PsRemoveLoadImageNotifyRoutine(Some(image_load_notify));
+        }
+        if REGISTRY_CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
+            // Reconstruct the LARGE_INTEGER from its stored QuadPart —
+            // CmUnRegisterCallback takes the cookie BY VALUE.
+            let cookie = LARGE_INTEGER {
+                QuadPart: REGISTRY_CALLBACK_COOKIE.load(Ordering::Acquire),
+            };
+            let _ = CmUnRegisterCallback(cookie);
         }
 
         // 2. Cancel a still-pending IRP (the agent might be blocked).
