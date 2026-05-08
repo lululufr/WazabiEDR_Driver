@@ -94,3 +94,16 @@ pub static REGISTRY_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
 ///
 /// Only meaningful when `REGISTRY_CALLBACK_REGISTERED` is true.
 pub static REGISTRY_CALLBACK_COOKIE: AtomicI64 = AtomicI64::new(0);
+
+/// `true` once `PsSetCreateThreadNotifyRoutine` succeeded. Used by
+/// `DriverUnload` to decide whether to call `PsRemoveCreateThreadNotifyRoutine`.
+pub static THREAD_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Opaque handle returned by `ObRegisterCallbacks` (an `IRP_MJ`-style
+/// allocation, opaque from our side). `null` means we never registered
+/// or have already unregistered.
+///
+/// Stored as a raw pointer because `ObUnRegisterCallbacks` takes the
+/// same handle it returned, by value, and we have nowhere else to put it.
+pub static OBJECT_CALLBACK_HANDLE: AtomicPtr<core::ffi::c_void> =
+    AtomicPtr::new(ptr::null_mut());

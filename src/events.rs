@@ -9,7 +9,7 @@
 ///
 /// The agent rejects any event with a different version instead of
 /// guessing field layouts.
-pub const EVENT_VERSION: u16 = 2;
+pub const EVENT_VERSION: u16 = 3;
 
 /// Maximum number of UTF-16 code units we copy from a process image path.
 ///
@@ -40,6 +40,22 @@ pub enum EventType {
     ProcessExit = 2,
     ImageLoad = 3,
     RegistryModify = 4,
+    ThreadCreate = 5,
+    ThreadExit = 6,
+    ProcessHandleAccess = 7,
+}
+
+/// Sub-discriminant for `ProcessHandleAccessEvent::operation`.
+#[repr(u16)]
+#[allow(dead_code)]
+pub enum HandleAccessOp {
+    /// `OB_OPERATION_HANDLE_CREATE` — a new handle is being opened on
+    /// the target process (e.g. `OpenProcess`).
+    Create = 1,
+    /// `OB_OPERATION_HANDLE_DUPLICATE` — an existing handle is being
+    /// duplicated (e.g. `DuplicateHandle`). Source/target processes are
+    /// also reported so handle-laundering is visible.
+    Duplicate = 2,
 }
 
 /// Sub-discriminant for `RegistryEvent::operation`.
@@ -167,4 +183,60 @@ pub struct RegistryEvent {
     /// Number of valid bytes in `data_preview`. Equals
     /// `min(data_size, REGISTRY_DATA_PREVIEW_MAX)`.
     pub data_preview_len: u16,
+}
+
+/// Thread-creation event.
+///
+/// Captures every new thread system-wide. The interesting field for an
+/// EDR is the relationship between `creating_process_id` and `process_id`:
+/// when they differ, the creating process spawned a thread *inside*
+/// another process — the classic `CreateRemoteThread`-based injection
+/// pattern.
+#[repr(C, packed)]
+pub struct ThreadCreateEvent {
+    pub header: EventHeader,
+    /// PID of the process the new thread runs in (its owner).
+    pub process_id: u32,
+    /// Kernel TID of the new thread.
+    pub thread_id: u32,
+    /// PID of the process that *requested* the thread creation, captured
+    /// via `PsGetCurrentProcessId` inside the notification. Equal to
+    /// `process_id` for normal in-process threads; different for remote
+    /// thread injections.
+    pub creating_process_id: u32,
+}
+
+/// Thread-exit event. We always know the owning process, never the actor.
+#[repr(C, packed)]
+pub struct ThreadExitEvent {
+    pub header: EventHeader,
+    pub process_id: u32,
+    pub thread_id: u32,
+}
+
+/// Process-handle-access event.
+///
+/// Emitted by the object-manager `OB_OPERATION_HANDLE_CREATE` /
+/// `OB_OPERATION_HANDLE_DUPLICATE` callbacks registered against
+/// `PsProcessType`. The driver only forwards events whose requested
+/// access intersects [`crate::callbacks::object::DANGEROUS_PROCESS_MASK`]
+/// — the noise-to-signal ratio of plain `OpenProcess(QUERY_LIMITED)`
+/// from system services would otherwise be unmanageable.
+///
+/// Both access masks are surfaced because OB callbacks installed by
+/// other drivers may strip rights from `DesiredAccess` — comparing it
+/// against `original_desired_access` exposes that interception.
+#[repr(C, packed)]
+pub struct ProcessHandleAccessEvent {
+    pub header: EventHeader,
+    /// PID of the process performing the open/duplicate.
+    pub source_process_id: u32,
+    /// PID of the process whose handle is being opened/duplicated.
+    pub target_process_id: u32,
+    /// Access mask after any prior callback in the chain stripped rights.
+    pub desired_access: u32,
+    /// Access mask the caller originally asked for.
+    pub original_desired_access: u32,
+    /// Which OB operation — see [`HandleAccessOp`].
+    pub operation: u16,
 }
