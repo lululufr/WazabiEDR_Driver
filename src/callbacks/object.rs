@@ -40,9 +40,9 @@ use wdk_sys::{
     OB_PREOP_CALLBACK_STATUS,
 };
 
-use crate::callbacks::header::make_header;
+use crate::callbacks::header::alloc_event_for;
 use crate::events::{EventType, HandleAccessOp, ProcessHandleAccessEvent};
-use crate::queue::submit::{alloc_event, submit_event};
+use crate::queue::submit::submit_event;
 
 // ── Win32 PROCESS_* access-mask bits ────────────────────────────────────
 // Repeated locally so we don't pull a Win32 dependency into the driver.
@@ -88,27 +88,25 @@ unsafe fn emit_handle_access(
     original: u32,
     op: HandleAccessOp,
 ) {
-    let size = core::mem::size_of::<ProcessHandleAccessEvent>() as u32;
     unsafe {
-        let buf = alloc_event(size);
-        if buf.is_null() {
+        let evt = alloc_event_for::<ProcessHandleAccessEvent>(
+            EventType::ProcessHandleAccess as u16,
+        );
+        if evt.is_null() {
             return;
         }
-        let evt = buf as *mut ProcessHandleAccessEvent;
 
         // Packed struct: write each field through `addr_of_mut!` so we
-        // never form a misaligned reference (UB in Rust).
-        ptr::write(
-            addr_of_mut!((*evt).header),
-            make_header(EventType::ProcessHandleAccess as u16, size),
-        );
+        // never form a misaligned reference (UB in Rust). Header is
+        // already in by `alloc_event_for`.
         ptr::write(addr_of_mut!((*evt).source_process_id), source_pid);
         ptr::write(addr_of_mut!((*evt).target_process_id), target_pid);
         ptr::write(addr_of_mut!((*evt).desired_access), desired);
         ptr::write(addr_of_mut!((*evt).original_desired_access), original);
         ptr::write(addr_of_mut!((*evt).operation), op as u16);
 
-        submit_event(buf, size);
+        let size = core::mem::size_of::<ProcessHandleAccessEvent>() as u32;
+        submit_event(evt as *mut u8, size);
     }
 }
 

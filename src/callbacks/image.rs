@@ -12,12 +12,14 @@
 //! thread. Same hard rule as the process callback — must NOT block.
 
 use core::ptr::{self, addr_of_mut};
+use core::sync::atomic::Ordering;
 
 use wdk_sys::{HANDLE, PIMAGE_INFO, PUNICODE_STRING};
 
-use crate::callbacks::header::make_header;
+use crate::callbacks::header::alloc_event_for;
 use crate::events::{EventType, IMAGE_PATH_MAX, ImageLoadEvent};
-use crate::queue::submit::{alloc_event, submit_event};
+use crate::queue::submit::submit_event;
+use crate::state::TRUNC_COUNT;
 
 /// Build and submit an `ImageLoad` event.
 ///
@@ -29,24 +31,14 @@ unsafe fn emit_image_load(
     full_image_name: PUNICODE_STRING,
     image_info: PIMAGE_INFO,
 ) {
-    let size = core::mem::size_of::<ImageLoadEvent>() as u32;
     unsafe {
-        let buf = alloc_event(size);
-        if buf.is_null() {
+        let evt = alloc_event_for::<ImageLoadEvent>(EventType::ImageLoad as u16);
+        if evt.is_null() {
             return;
         }
-        // Zero whole buffer: any unused bytes of `image_path` ship as 0
-        // instead of leaking pool memory; missing fields stay at 0.
-        ptr::write_bytes(buf, 0, size as usize);
-
-        let evt = buf as *mut ImageLoadEvent;
 
         // Packed struct → write fields through raw pointers (`addr_of_mut!`)
         // to avoid forming misaligned references (UB).
-        ptr::write(
-            addr_of_mut!((*evt).header),
-            make_header(EventType::ImageLoad as u16, size),
-        );
         ptr::write(addr_of_mut!((*evt).process_id), pid);
 
         if !image_info.is_null() {
@@ -63,13 +55,17 @@ unsafe fn emit_image_load(
                 // Reserve one slot below MAX so a fully-truncated path stays
                 // distinguishable from one that exactly fills the buffer.
                 let copy = chars.min(IMAGE_PATH_MAX - 1);
+                if chars > copy {
+                    TRUNC_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
                 let dst = addr_of_mut!((*evt).image_path) as *mut u16;
                 ptr::copy_nonoverlapping(img.Buffer, dst, copy);
                 ptr::write(addr_of_mut!((*evt).image_path_len), copy as u16);
             }
         }
 
-        submit_event(buf, size);
+        let size = core::mem::size_of::<ImageLoadEvent>() as u32;
+        submit_event(evt as *mut u8, size);
     }
 }
 

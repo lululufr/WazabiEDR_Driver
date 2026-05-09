@@ -9,7 +9,10 @@
 ///
 /// The agent rejects any event with a different version instead of
 /// guessing field layouts.
-pub const EVENT_VERSION: u16 = 3;
+///
+/// Bumped to 4 when `EventHeader::trunc_count` was added (driver-side
+/// counter of fields that had to be truncated to fit fixed-size buffers).
+pub const EVENT_VERSION: u16 = 4;
 
 /// Maximum number of UTF-16 code units we copy from a process image path.
 ///
@@ -88,6 +91,11 @@ pub enum RegistryOp {
 /// `drop_count` reports how many events the driver had to evict from the
 /// queue between the previous delivered event and this one — that lets the
 /// agent surface gaps without us emitting a separate "loss" event type.
+///
+/// `trunc_count` reports how many path/name/data fields had to be
+/// truncated to fit the per-event fixed-size buffers since the previous
+/// delivered event. A non-zero value tells the agent that some long
+/// strings on the wire were cut short.
 #[repr(C, packed)]
 pub struct EventHeader {
     pub version: u16,
@@ -96,6 +104,7 @@ pub struct EventHeader {
     pub timestamp: i64,
     pub size: u32,
     pub drop_count: u32,
+    pub trunc_count: u32,
 }
 
 #[repr(C, packed)]

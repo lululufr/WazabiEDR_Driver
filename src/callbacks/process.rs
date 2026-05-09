@@ -9,12 +9,14 @@
 //! `CreateProcess` in the system passes through this callback.
 
 use core::ptr::{self, addr_of_mut};
+use core::sync::atomic::Ordering;
 
 use wdk_sys::{PEPROCESS, PPS_CREATE_NOTIFY_INFO};
 
-use crate::callbacks::header::make_header;
+use crate::callbacks::header::alloc_event_for;
 use crate::events::{EventType, IMAGE_PATH_MAX, ProcessCreateEvent, ProcessExitEvent};
-use crate::queue::submit::{alloc_event, submit_event};
+use crate::queue::submit::submit_event;
+use crate::state::TRUNC_COUNT;
 
 /// Build and submit a `ProcessExit` event.
 ///
@@ -22,51 +24,37 @@ use crate::queue::submit::{alloc_event, submit_event};
 /// "we lost an event because we couldn't allocate a buffer to record the
 /// loss". The next successful event will surface the gap via `DROP_COUNT`.
 unsafe fn emit_process_exit(pid: u32) {
-    let size = core::mem::size_of::<ProcessExitEvent>() as u32;
     unsafe {
-        let buf = alloc_event(size);
-        if buf.is_null() {
+        let evt = alloc_event_for::<ProcessExitEvent>(EventType::ProcessExit as u16);
+        if evt.is_null() {
             return;
         }
-        let evt = buf as *mut ProcessExitEvent;
-        ptr::write(
-            evt,
-            ProcessExitEvent {
-                header: make_header(EventType::ProcessExit as u16, size),
-                process_id: pid,
-            },
-        );
-        submit_event(buf, size);
+        // Header is already written by `alloc_event_for`; only the
+        // ProcessExit-specific tail remains.
+        ptr::write(addr_of_mut!((*evt).process_id), pid);
+        let size = core::mem::size_of::<ProcessExitEvent>() as u32;
+        submit_event(evt as *mut u8, size);
     }
 }
 
 /// Build and submit a `ProcessCreate` event.
 ///
 /// Copies as much of the image path as fits into `IMAGE_PATH_MAX` UTF-16
-/// units. Truncated paths are still better than nothing — userland can
-/// detect truncation when `image_path_len == IMAGE_PATH_MAX - 1`.
+/// units. Truncated paths bump `TRUNC_COUNT` so the agent can surface
+/// the loss on the next delivered event.
 unsafe fn emit_process_create(pid: u32, info: PPS_CREATE_NOTIFY_INFO) {
-    let size = core::mem::size_of::<ProcessCreateEvent>() as u32;
     unsafe {
-        let buf = alloc_event(size);
-        if buf.is_null() {
+        let evt = alloc_event_for::<ProcessCreateEvent>(EventType::ProcessCreate as u16);
+        if evt.is_null() {
             return;
         }
-        // Zero the whole buffer so any unused bytes of `image_path` ship
-        // as 0 instead of leaking uninitialized pool memory to userland.
-        ptr::write_bytes(buf, 0, size as usize);
 
-        let evt = buf as *mut ProcessCreateEvent;
         let parent = (*info).ParentProcessId as usize as u32;
         let creator = (*info).CreatingThreadId.UniqueProcess as usize as u32;
 
         // The struct is `repr(C, packed)`, so we MUST write fields through
         // raw pointers (`addr_of_mut!`). Taking `&mut field` directly on a
         // packed struct produces a misaligned reference — UB.
-        ptr::write(
-            addr_of_mut!((*evt).header),
-            make_header(EventType::ProcessCreate as u16, size),
-        );
         ptr::write(addr_of_mut!((*evt).process_id), pid);
         ptr::write(addr_of_mut!((*evt).parent_process_id), parent);
         ptr::write(addr_of_mut!((*evt).creating_process_id), creator);
@@ -83,13 +71,17 @@ unsafe fn emit_process_create(pid: u32, info: PPS_CREATE_NOTIFY_INFO) {
                 // remains distinguishable from one that exactly fills the
                 // buffer.
                 let copy = chars.min(IMAGE_PATH_MAX - 1);
+                if chars > copy {
+                    TRUNC_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
                 let dst = addr_of_mut!((*evt).image_path) as *mut u16;
                 ptr::copy_nonoverlapping(img.Buffer, dst, copy);
                 ptr::write(addr_of_mut!((*evt).image_path_len), copy as u16);
             }
         }
 
-        submit_event(buf, size);
+        let size = core::mem::size_of::<ProcessCreateEvent>() as u32;
+        submit_event(evt as *mut u8, size);
     }
 }
 

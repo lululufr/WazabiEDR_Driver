@@ -26,16 +26,15 @@ use core::ptr::{self, addr_of_mut};
 
 use wdk_sys::{ntddk::PsGetCurrentProcessId, BOOLEAN, HANDLE};
 
-use crate::callbacks::header::make_header;
+use crate::callbacks::header::alloc_event_for;
 use crate::events::{EventType, ThreadCreateEvent, ThreadExitEvent};
-use crate::queue::submit::{alloc_event, submit_event};
+use crate::queue::submit::submit_event;
 
 /// Build and submit a `ThreadCreate` event.
 unsafe fn emit_thread_create(pid: u32, tid: u32) {
-    let size = core::mem::size_of::<ThreadCreateEvent>() as u32;
     unsafe {
-        let buf = alloc_event(size);
-        if buf.is_null() {
+        let evt = alloc_event_for::<ThreadCreateEvent>(EventType::ThreadCreate as u16);
+        if evt.is_null() {
             return;
         }
         // Capture who *requested* the thread creation. For an in-process
@@ -43,47 +42,29 @@ unsafe fn emit_thread_create(pid: u32, tid: u32) {
         // equal `pid`; for `CreateRemoteThread` it'll be the attacker.
         let creator = PsGetCurrentProcessId() as usize as u32;
 
-        let evt = buf as *mut ThreadCreateEvent;
-        ptr::write(
-            evt,
-            ThreadCreateEvent {
-                header: make_header(EventType::ThreadCreate as u16, size),
-                process_id: pid,
-                thread_id: tid,
-                creating_process_id: creator,
-            },
-        );
-        // No `addr_of_mut!` gymnastics needed here: every field is a u32
-        // and the struct is small enough that we can just write the
-        // whole thing in one go. The `repr(C, packed)` still applies.
-        let _ = evt; // keep `evt` named for the safety comment above
-        submit_event(buf, size);
+        // Packed struct: write each field through `addr_of_mut!` so we
+        // never form a misaligned reference (UB). Header is already in.
+        ptr::write(addr_of_mut!((*evt).process_id), pid);
+        ptr::write(addr_of_mut!((*evt).thread_id), tid);
+        ptr::write(addr_of_mut!((*evt).creating_process_id), creator);
+
+        let size = core::mem::size_of::<ThreadCreateEvent>() as u32;
+        submit_event(evt as *mut u8, size);
     }
 }
 
 /// Build and submit a `ThreadExit` event. Symmetrical and even cheaper.
 unsafe fn emit_thread_exit(pid: u32, tid: u32) {
-    let size = core::mem::size_of::<ThreadExitEvent>() as u32;
     unsafe {
-        let buf = alloc_event(size);
-        if buf.is_null() {
+        let evt = alloc_event_for::<ThreadExitEvent>(EventType::ThreadExit as u16);
+        if evt.is_null() {
             return;
         }
-        let evt = buf as *mut ThreadExitEvent;
-        ptr::write(
-            evt,
-            ThreadExitEvent {
-                header: make_header(EventType::ThreadExit as u16, size),
-                process_id: pid,
-                thread_id: tid,
-            },
-        );
-        // Keep the `addr_of_mut!` reminder for future maintainers who
-        // might add wider fields to ThreadExitEvent: the moment the
-        // struct grows beyond same-sized scalars, the one-shot `write`
-        // above must be replaced with field-by-field writes.
-        let _ = addr_of_mut!((*evt).process_id);
-        submit_event(buf, size);
+        ptr::write(addr_of_mut!((*evt).process_id), pid);
+        ptr::write(addr_of_mut!((*evt).thread_id), tid);
+
+        let size = core::mem::size_of::<ThreadExitEvent>() as u32;
+        submit_event(evt as *mut u8, size);
     }
 }
 
