@@ -6,10 +6,10 @@
 //! from the callbacks themselves.
 
 use core::ptr;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use wdk_sys::{
-    ntddk::{ExAllocatePool2, ExFreePool},
+    ntddk::{DbgPrint, ExAllocatePool2, ExFreePool},
     KSPIN_LOCK, POOL_FLAG_NON_PAGED, PVOID, STATUS_BUFFER_TOO_SMALL, STATUS_SUCCESS,
 };
 
@@ -18,14 +18,41 @@ use crate::queue::ring::queue_push_locked;
 use crate::state::{DROP_COUNT, PENDING_IRP, POOL_TAG, QUEUE_LOCK};
 use crate::util::SpinLockGuard;
 
+/// Cumulative count of `alloc_event` failures since boot. Used purely to
+/// drive the rate-limited `DbgPrint` below — never read by anything else.
+static OOM_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Emit a kernel-debug line every `OOM_LOG_EVERY` allocation failures.
+///
+/// One line per failure would dominate the system log under memory
+/// pressure (where the failures cluster). One line per N gives the
+/// operator enough signal to know "this driver is dropping events
+/// because of pool exhaustion" without burying everything else.
+const OOM_LOG_EVERY: u32 = 256;
+
 /// Allocate a non-paged buffer to hold an outgoing event.
 ///
-/// Returns `null` on allocation failure. Callers must handle this
-/// gracefully — under memory pressure, dropping a single event is
-/// preferable to bug-checking.
+/// Returns `null` on allocation failure. On failure we also bump
+/// `DROP_COUNT` (the event will never reach the queue) and emit a
+/// rate-limited `DbgPrint` so the operator gets a hint without the log
+/// being flooded.
 pub unsafe fn alloc_event(size: u32) -> *mut u8 {
     unsafe {
-        ExAllocatePool2(POOL_FLAG_NON_PAGED, size as u64, POOL_TAG) as *mut u8
+        let buf = ExAllocatePool2(POOL_FLAG_NON_PAGED, size as u64, POOL_TAG) as *mut u8;
+        if buf.is_null() {
+            // Account for the loss exactly once per failed allocation:
+            // the event we wanted to record is gone, so the next
+            // delivered header should report it via `drop_count`.
+            DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            // Rate-limited DbgPrint: every Nth failure prints the
+            // running total so an operator reading WinDbg / DebugView
+            // sees that something is dropping events.
+            let n = OOM_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(OOM_LOG_EVERY) {
+                DbgPrint(c"[WazabiEDR] alloc_event OOM\n".as_ptr());
+            }
+        }
+        buf
     }
 }
 

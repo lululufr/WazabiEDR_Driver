@@ -58,6 +58,12 @@ pub static QUEUE_LEN: SyncCell<usize> = SyncCell::new(0);
 /// agent only sees the gap accumulated since its last delivered event.
 pub static DROP_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Total fields (image paths, registry key paths, value names, value-data
+/// previews) that had to be truncated because they exceeded the event's
+/// fixed-size buffer. Same swap-to-zero policy as `DROP_COUNT`: each
+/// outgoing header carries the number accumulated since the previous one.
+pub static TRUNC_COUNT: AtomicU32 = AtomicU32::new(0);
+
 /// Single-client pending IRP slot.
 ///
 /// `null` means nobody is currently blocked in `IOCTL_WEDR_GET_EVENT`.
