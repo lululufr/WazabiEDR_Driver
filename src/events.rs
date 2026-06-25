@@ -10,15 +10,28 @@
 /// The agent rejects any event with a different version instead of
 /// guessing field layouts.
 ///
-/// Bumped to 4 when `EventHeader::trunc_count` was added (driver-side
-/// counter of fields that had to be truncated to fit fixed-size buffers).
-pub const EVENT_VERSION: u16 = 4;
+/// Bumped to 6 when `ProcessCreateEvent` gained `integrity_level` and
+/// `ProcessExitEvent` gained `exit_code` — the two enrichments needed
+/// to flag UAC bypasses and to know whether a process exited cleanly
+/// or via TerminateProcess.
+pub const EVENT_VERSION: u16 = 6;
 
 /// Maximum number of UTF-16 code units we copy from a process image path.
 ///
 /// `ProcessCreateEvent` has a fixed-size buffer, so longer NT paths get
 /// truncated; `image_path_len` reports the exact number of valid units.
 pub const IMAGE_PATH_MAX: usize = 512;
+
+/// Maximum number of UTF-16 code units we copy from a process command
+/// line. Tuned wide enough to capture realistic PowerShell-encoded
+/// payloads (typical `-EncodedCommand` blobs run a few KB) without
+/// blowing the per-event size out of proportion.
+pub const COMMAND_LINE_MAX: usize = 4096;
+
+/// Maximum number of UTF-16 code units shipped for the SDDL string form
+/// of the user SID (e.g. `S-1-5-21-…-1001`). Real SIDs cap at ~68 chars;
+/// 192 leaves comfortable headroom + alignment.
+pub const USER_SID_MAX: usize = 192;
 
 /// Maximum number of UTF-16 code units we copy from a registry key path.
 /// Long keys (deep `HKLM\…\…` paths) get truncated, with `key_path_len`
@@ -118,12 +131,73 @@ pub struct ProcessCreateEvent {
     pub image_path: [u16; IMAGE_PATH_MAX],
     /// UTF-16 character count (NOT bytes), no terminating NUL.
     pub image_path_len: u16,
+    /// Command line of the new process (UTF-16, no terminating NUL).
+    /// Populated from `PS_CREATE_NOTIFY_INFO::CommandLine`; truncated to
+    /// `COMMAND_LINE_MAX` units with `TRUNC_COUNT` bumped when so.
+    /// `command_line_len == 0` means the kernel didn't supply one (rare,
+    /// e.g. kernel-launched processes without a backing CreateProcess).
+    pub command_line: [u16; COMMAND_LINE_MAX],
+    pub command_line_len: u16,
+    /// NT path of the **parent** executable, resolved via
+    /// `PsLookupProcessByProcessId(parent_pid)` + `SeLocateProcessImageName`.
+    /// `parent_image_path_len == 0` when the parent has already exited or
+    /// the lookup failed — common for orphan processes. Same truncation
+    /// rules as `image_path`.
+    pub parent_image_path: [u16; IMAGE_PATH_MAX],
+    pub parent_image_path_len: u16,
+    /// SDDL string form of the primary token's user SID (e.g.
+    /// `S-1-5-21-...-1001`). Resolved via `PsReferencePrimaryToken` +
+    /// `SeQueryInformationToken(TokenUser)` + `RtlConvertSidToUnicodeString`.
+    /// `user_sid_len == 0` if any step failed (e.g. token unavailable
+    /// during early-stage init). Userland resolves to `DOMAIN\user`.
+    pub user_sid: [u16; USER_SID_MAX],
+    pub user_sid_len: u16,
+    /// Mandatory Integrity Level RID extracted from the token's
+    /// `TokenIntegrityLevel` SID — the last subauthority of an
+    /// `S-1-16-XXXX` SID. Standard values:
+    /// - `0x0000` Untrusted
+    /// - `0x1000` Low
+    /// - `0x2000` Medium (default user)
+    /// - `0x2100` Medium-Plus (UAC consented elevation, no admin token)
+    /// - `0x3000` High (elevated admin)
+    /// - `0x4000` System
+    /// - `0x5000` Protected Process
+    ///
+    /// `0xFFFFFFFF` = unresolved. Userland turns the RID into a label
+    /// (`low`/`medium`/`high`/...). Critical for spotting UAC bypasses:
+    /// a `medium`-token process spawning a `high`-token child without
+    /// going through the consent UI is a strong signal.
+    pub integrity_level: u32,
 }
+
+/// Compile-time sizeof checks — guarantee wire-format byte-identity
+/// with the agent. If anyone ever drifts a field width or reorders,
+/// the build fails here rather than the agent silently parsing garbage.
+///
+/// Expected sizes (recomputed from the packed layout):
+/// - `EventHeader`         = 2+2+8+4+4+4 = 24 bytes
+/// - `ProcessCreateEvent`  = 24 (header) + 4+4+4 (pid/ppid/cpid)
+///                         + 1024+2 (image_path + len)
+///                         + 8192+2 (command_line + len)
+///                         + 1024+2 (parent_image_path + len)
+///                         + 384+2  (user_sid + len)
+///                         + 4      (integrity_level)
+///                         = 10672 bytes
+/// - `ProcessExitEvent`    = 24 + 4 + 4 = 32 bytes
+const _: () = assert!(core::mem::size_of::<EventHeader>() == 24);
+const _: () = assert!(core::mem::size_of::<ProcessCreateEvent>() == 10672);
+const _: () = assert!(core::mem::size_of::<ProcessExitEvent>() == 32);
 
 #[repr(C, packed)]
 pub struct ProcessExitEvent {
     pub header: EventHeader,
     pub process_id: u32,
+    /// Process exit status, retrieved via `PsGetProcessExitStatus`
+    /// **after** the notify (Windows fills the status before calling
+    /// us with `create_info == NULL`). 0 = clean exit (`ExitProcess(0)`),
+    /// non-zero values are either explicit exit codes or NTSTATUS codes
+    /// from `TerminateProcess` (e.g. `0xC0000005` for AV-killed targets).
+    pub exit_code: i32,
 }
 
 /// Image-load event.
