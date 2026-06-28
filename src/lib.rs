@@ -166,84 +166,71 @@ pub unsafe extern "system" fn driver_entry(
             return status;
         }
 
-        // ── 5. Register the process create/exit callback. ───────────────
-        // From this point on `process_notify` may run on another CPU, so
-        // any subsequent failure must unwind it.
+        // ── 5-9. Callbacks (soft-fail) ──────────────────────────────────
+        // Cross-version portability : seul `\Device\WazabiEDR` + son
+        // symlink sont obligatoires (sans eux l'agent ne peut pas se
+        // connecter). Les 5 callbacks de notification sont optionnels :
+        // si l'un d'eux echoue (slot sature par un autre EDR, altitude
+        // collision sur cette build, API absente, etc.), on logge et
+        // on continue. L'agent recevra simplement moins de types
+        // d'evenements -- mieux que de bloquer le driver entier.
+        //
+        // L'agent peut detecter les callbacks manquants via la table
+        // *_CALLBACK_REGISTERED, mais pour l'instant c'est un detail.
+        //
+        // Chaque flag REGISTERED reste False si l'enregistrement a
+        // foire ; DriverUnload utilise deja ces flags pour ne
+        // deregister que ce qui a vraiment ete register, donc pas de
+        // changement requis cote teardown.
+        let mut registered_count: u32 = 0;
+        let mut failed_count: u32 = 0;
+
+        // 5. Process create/exit
         let status = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 0);
         if status < 0 {
-            DbgPrint(c"[WazabiEDR] PsSetCreateProcessNotifyRoutineEx failed\n".as_ptr());
-            let _ = IoDeleteSymbolicLink(&mut symlink);
-            IoDeleteDevice(device);
-            CONTROL_DEVICE.store(ptr::null_mut(), Ordering::Release);
-            return status;
+            DbgPrint(c"[WazabiEDR] PsSetCreateProcessNotifyRoutineEx failed (soft-fail, continuing)\n".as_ptr());
+            failed_count += 1;
+        } else {
+            PROCESS_CALLBACK_REGISTERED.store(true, Ordering::Release);
+            registered_count += 1;
         }
-        PROCESS_CALLBACK_REGISTERED.store(true, Ordering::Release);
 
-        // ── 6. Register the image-load callback. ────────────────────────
-        // Same caveat as the process callback: once it's live, the routine
-        // can run on another CPU, so any later failure must unwind it.
+        // 6. Image load
         let status = PsSetLoadImageNotifyRoutine(Some(image_load_notify));
         if status < 0 {
-            DbgPrint(c"[WazabiEDR] PsSetLoadImageNotifyRoutine failed\n".as_ptr());
-            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
-            PROCESS_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let _ = IoDeleteSymbolicLink(&mut symlink);
-            IoDeleteDevice(device);
-            CONTROL_DEVICE.store(ptr::null_mut(), Ordering::Release);
-            return status;
+            DbgPrint(c"[WazabiEDR] PsSetLoadImageNotifyRoutine failed (soft-fail, continuing)\n".as_ptr());
+            failed_count += 1;
+        } else {
+            IMAGE_CALLBACK_REGISTERED.store(true, Ordering::Release);
+            registered_count += 1;
         }
-        IMAGE_CALLBACK_REGISTERED.store(true, Ordering::Release);
 
-        // ── 7. Register the registry-modification callback. ─────────────
-        // CmRegisterCallback returns a cookie via out-parameter; we stash
-        // its `QuadPart` in a static atomic so DriverUnload can rebuild
-        // the LARGE_INTEGER and call CmUnRegisterCallback.
+        // 7. Registry-modification
         let mut cookie: LARGE_INTEGER = core::mem::zeroed();
         let status = CmRegisterCallback(Some(registry_notify), ptr::null_mut(), &mut cookie);
         if status < 0 {
-            DbgPrint(c"[WazabiEDR] CmRegisterCallback failed\n".as_ptr());
-            let _ = PsRemoveLoadImageNotifyRoutine(Some(image_load_notify));
-            IMAGE_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
-            PROCESS_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let _ = IoDeleteSymbolicLink(&mut symlink);
-            IoDeleteDevice(device);
-            CONTROL_DEVICE.store(ptr::null_mut(), Ordering::Release);
-            return status;
+            DbgPrint(c"[WazabiEDR] CmRegisterCallback failed (soft-fail, continuing)\n".as_ptr());
+            failed_count += 1;
+        } else {
+            REGISTRY_CALLBACK_COOKIE.store(cookie.QuadPart, Ordering::Release);
+            REGISTRY_CALLBACK_REGISTERED.store(true, Ordering::Release);
+            registered_count += 1;
         }
-        REGISTRY_CALLBACK_COOKIE.store(cookie.QuadPart, Ordering::Release);
-        REGISTRY_CALLBACK_REGISTERED.store(true, Ordering::Release);
 
-        // ── 8. Register the thread create/exit callback. ────────────────
-        // Tiny callback (three u32s per event); cheap relative to all the
-        // others. Must still be unwound if anything later fails.
+        // 8. Thread create/exit
         let status = PsSetCreateThreadNotifyRoutine(Some(thread_notify));
         if status < 0 {
-            DbgPrint(c"[WazabiEDR] PsSetCreateThreadNotifyRoutine failed\n".as_ptr());
-            let cookie_undo = LARGE_INTEGER {
-                QuadPart: REGISTRY_CALLBACK_COOKIE.load(Ordering::Acquire),
-            };
-            let _ = CmUnRegisterCallback(cookie_undo);
-            REGISTRY_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let _ = PsRemoveLoadImageNotifyRoutine(Some(image_load_notify));
-            IMAGE_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
-            PROCESS_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let _ = IoDeleteSymbolicLink(&mut symlink);
-            IoDeleteDevice(device);
-            CONTROL_DEVICE.store(ptr::null_mut(), Ordering::Release);
-            return status;
+            DbgPrint(c"[WazabiEDR] PsSetCreateThreadNotifyRoutine failed (soft-fail, continuing)\n".as_ptr());
+            failed_count += 1;
+        } else {
+            THREAD_CALLBACK_REGISTERED.store(true, Ordering::Release);
+            registered_count += 1;
         }
-        THREAD_CALLBACK_REGISTERED.store(true, Ordering::Release);
 
-        // ── 9. Register the object-handle access callback. ──────────────
-        // This is the most fiddly registration: we have to hand the OB
-        // manager a small array of `OB_OPERATION_REGISTRATION` plus a
-        // `OB_CALLBACK_REGISTRATION` envelope, all by pointer. Stack-
-        // allocated is fine — `ObRegisterCallbacks` copies what it needs.
-        //
-        // We hook on `PsProcessType` only (handles into processes). One
-        // entry registers both CREATE and DUPLICATE.
+        // 9. Object-handle access
+        // C'est le candidat le plus probable a echouer sur certaines
+        // builds Windows (PsProcessType invalide, altitude reservee,
+        // version OB_FLT_REGISTRATION_VERSION incompatible, etc.).
         let mut altitude: UNICODE_STRING = core::mem::zeroed();
         let altitude_buf: [u16; 7] = wstr16(OB_ALTITUDE);
         RtlInitUnicodeString(&mut altitude, altitude_buf.as_ptr());
@@ -264,29 +251,22 @@ pub unsafe extern "system" fn driver_entry(
         let mut handle: PVOID = ptr::null_mut();
         let status = ObRegisterCallbacks(&mut cb_reg, &mut handle);
         if status < 0 {
-            DbgPrint(c"[WazabiEDR] ObRegisterCallbacks failed\n".as_ptr());
-            let _ = PsRemoveCreateThreadNotifyRoutine(Some(thread_notify));
-            THREAD_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let cookie_undo = LARGE_INTEGER {
-                QuadPart: REGISTRY_CALLBACK_COOKIE.load(Ordering::Acquire),
-            };
-            let _ = CmUnRegisterCallback(cookie_undo);
-            REGISTRY_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let _ = PsRemoveLoadImageNotifyRoutine(Some(image_load_notify));
-            IMAGE_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let _ = PsSetCreateProcessNotifyRoutineEx(Some(process_notify), 1);
-            PROCESS_CALLBACK_REGISTERED.store(false, Ordering::Release);
-            let _ = IoDeleteSymbolicLink(&mut symlink);
-            IoDeleteDevice(device);
-            CONTROL_DEVICE.store(ptr::null_mut(), Ordering::Release);
-            return status;
+            DbgPrint(c"[WazabiEDR] ObRegisterCallbacks failed (soft-fail, continuing)\n".as_ptr());
+            failed_count += 1;
+        } else {
+            OBJECT_CALLBACK_HANDLE.store(handle as *mut core::ffi::c_void, Ordering::Release);
+            registered_count += 1;
         }
-        OBJECT_CALLBACK_HANDLE.store(handle as *mut core::ffi::c_void, Ordering::Release);
 
-        DbgPrint(
-            c"[WazabiEDR] ready (\\\\.\\WazabiEDR + Process/Image/Registry/Thread/Object notifies)\n"
-                .as_ptr(),
-        );
+        if failed_count > 0 {
+            DbgPrint(c"[WazabiEDR] ready (degraded: some callbacks unavailable on this Windows build)\n".as_ptr());
+        } else {
+            DbgPrint(
+                c"[WazabiEDR] ready (\\\\.\\WazabiEDR + Process/Image/Registry/Thread/Object notifies)\n"
+                    .as_ptr(),
+            );
+        }
+        let _ = registered_count; // pour quand on l'exposera via IOCTL ou stat
     }
 
     STATUS_SUCCESS
