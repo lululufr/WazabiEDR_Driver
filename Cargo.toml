@@ -18,7 +18,13 @@ crate-type = ["cdylib"]
 [package.metadata.wdk.driver-model]
 driver-type = "KMDF"
 kmdf-version-major = 1
-target-kmdf-version-minor = 33
+# KMDF 1.27 = Win10 2004+ (build 19041+) et Win11 — large compat. KMDF 1.33
+# (la version "latest" pousse par defaut le WDK 26100) ne tourne que sur
+# Win11 22H2 (22621+) ; sur Win10 22H2 (19045) le driver crash AVANT meme
+# DriverEntry (PE Header OK mais runtime KMDF absent), pas de DbgPrint
+# visible dans DebugView. Symptome typique : sc start renvoie 87 et le
+# kernel-PnP log "failed to load" + STATUS_INVALID_PARAMETER.
+target-kmdf-version-minor = 27
 
 [profile.dev]
 panic = "abort"
