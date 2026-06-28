@@ -172,6 +172,25 @@ jobs:
         run: cargo make
 
       # ── Packaging & Upload ────────────────────────────────────────────────────
+      - name: Bundle devcon.exe dans le package
+        shell: pwsh
+        run: |
+          # devcon.exe (Microsoft, redistribuable) est requis par
+          # install-driver.ps1 pour créer le root PnP device sur les
+          # endpoints. Le WDK n'est PAS installé sur les machines
+          # cibles, donc on embarque devcon depuis le WDK NuGet du
+          # runner pour qu'install-driver.ps1 le trouve dans
+          # PackageDir.
+          $pkg = "target\debug\WazabiEDR_Driver_package"
+          $devcon = Get-ChildItem -Path "$env:NugetPackagesRoot" -Recurse -Filter "devcon.exe" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\x64\\" } |
+            Select-Object -First 1
+          if (-not $devcon) {
+            throw "devcon.exe introuvable dans $env:NugetPackagesRoot — le WDK x64 n'a pas été installé correctement"
+          }
+          Copy-Item -Force $devcon.FullName "$pkg\devcon.exe"
+          Write-Host "Bundled devcon.exe ($([math]::Round($devcon.Length / 1KB, 1)) KB) depuis $($devcon.FullName)"
+
       - name: Package artifacts
         shell: pwsh
         run: |
