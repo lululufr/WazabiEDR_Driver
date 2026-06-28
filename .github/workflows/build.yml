@@ -93,16 +93,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\packages
-          key: wdk-10.0.26100
+          key: wdk-10.0.22621
 
-      - name: Install WDK 10.0.26100 via NuGet
+      - name: Install WDK 10.0.22621 via NuGet
         if: steps.cache-wdk.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           Set-StrictMode -Version Latest
           $ProgressPreference = 'SilentlyContinue'
 
-          $baseVersion  = "10.0.26100"
+          $baseVersion  = "10.0.22621"
           $packagesRoot = "C:\packages"
           $nugetApiUrl  = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/index.json"
 
@@ -126,7 +126,7 @@ jobs:
         shell: pwsh
         run: |
           Set-StrictMode -Version Latest
-          $baseVersion  = "10.0.26100"
+          $baseVersion  = "10.0.22621"
           $packagesRoot = "C:\packages"
 
           $pkgDirs   = Get-ChildItem $packagesRoot -Directory |
