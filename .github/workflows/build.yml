@@ -3,6 +3,13 @@ name: Build WazabiEDR Driver
 on:
   pull_request:
     branches: [main]
+  # Versioned tag pushes feed the WazabiEDR_Installer build: it
+  # downloads the matching vX.Y.Z asset and bundles the driver
+  # package into setup.exe. Without this trigger the
+  # "Create or update versioned release" step below would never fire.
+  push:
+    tags:
+      - 'v*'
 
 env:
   CARGO_TERM_COLOR: always
